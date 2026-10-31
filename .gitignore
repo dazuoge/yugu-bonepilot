@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Blender
+*.blend
+*.blend1
+
+# 压缩包
+*.zip
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
