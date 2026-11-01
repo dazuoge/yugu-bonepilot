@@ -1,6 +1,283 @@
 # -*- coding: utf-8 -*-
 # Controller Navigator v5.0.0 — IK/FK 一键切换 + 全键位自定义 + 集合独占
 #
+# v5.2.26 — 修「重心 c_traj 动过之后，脚/手 IK 第一下拖动整条腿弹起」：
+#   c_foot_ik / c_hand_ik 挂 Child Of(c_traj)，可见矩阵由约束求出，而写
+#   `pb.matrix` 的 setter 不认约束 —— 读出来再写回去会把 c_traj 的偏移再叠一遍
+#   （实测 0.62m）。改用新增的 _apply_visible_translation（带 K 共轭）写 basis，
+#   _move_preview 与 _move_flush 兜底两处同步。
+# v5.2.25 — 修「根环（大环）旋转/移动后，其他控制器第一下拖动就跳」：
+#   _bone_point_world 父级链换算少了 parent rest 还原（实测偏 1.4~1.9 单位、
+#   判轴方向错 93°~180°），_screen_len 改用骨骼真实头尾投影，模态加首帧大位移守卫
+# v5.2.24 — IK/FK 饼菜单：死开关过滤 + 名称显示全（Ju_Fufu 实测）
+
+#   1. Ju_Fufu 的 IK/FK 弹出面板出现 5 行肢体、右腿有两个摸不着头脑的
+#      开关。实测根因：PROPERTIES 骨上同时挂着 Leg_IK_FK.R（下划线，
+#      驱动 MCH-SWI-Thigh/Calf/Foot 切换链，真开关）和 Leg_IK-FK.R
+#      （连字符，绑定作者改名后的**残留废属性**，零驱动器引用）——
+#      两根都被当成肢体认出来了。
+#      修法（沿用 v5.2.13「只信驱动器」）：新增 _driven_switch_props()，
+#      扫 Object/Armature 两份 animation_data 的全部驱动器变量目标，
+#      没被任何驱动器引用的开关属性直接丢弃；整根骨架一个驱动器都没
+#      有的极端情况不过滤（机制可能不走驱动器，宁可信其有）。
+#      实测：Ju_Fufu 5 → 4 行（双臂双腿）；Anby 4 行不变。
+#   2. 弹出面板名称列太窄：Leg_IK_FK.R 被截成「Leg_IK...」。面板宽
+#      238 → 296，名称列占比 0.55 → 0.78，完整开关名直接可见。
+#
+# v5.2.23 — 一键装配规则升级（12 个测试骨架全量实测训练）
+
+#   v5.2.22 及以前的装配规则在「一键分配测试」12 个骨架上暴露四类问题：
+#   ① Wise_V1 的 Necklace（项链）靠 "neck" 子串命中「头」、以更高可信级
+#      抢走主饼头格，Eyes 反被挤进细节饼。ASCII 部位词改成「词边界 +
+#      可选复数 s」匹配（necklace / Headphones / Armor / Chestplate 这类
+#      复合词不再命中），中文词保持子串。
+#   ② `------------` 纯符号分隔集合、`[ ORG ]` / `[ DEF ]` 空壳标签集合
+#      （空的）以前一路排进细节饼白占格 —— 有正常名字的空集合（Rigify
+#      的空 FK 集合）不受影响。
+#   ③ SAnby 系的修形集合是 TWK_ 前缀（TWK_Arm.L），变体认不出 → 挤进
+#      细节饼把 Hair / Accessories 压成一格两个。TWK_ 前缀现在认成
+#      Tweak 变体走附属饼。
+#   ④ 不同 (部位, 侧别) 组映射到同一格时不再无脑叠加：课鲁凯皮肤骨架
+#      `Upper Arm` 挤进右臂格、`Toes (Cerulean Breaker)` 挤进右腿格，
+#      点一格选中三套。现在带 IK/FK 配对标记的组胜出，输家整组下沉
+#      细节饼；都不带时取名字最短的组。
+#
+# v5.2.22 — 星标独显改用原生 is_solo（不再逐个 is_visible 藏别的集合）
+#
+#   以前独显=把其他集合 is_visible=False、还原靠自己的快照写回；现在
+#   给集合打 is_solo 星标（骨骼集合面板同一个开关）：原始可见性全程
+#   不动，取消星标 Blender 自动还原，面板上星标亮在哪一目了然。
+#   范围保持旧语义：目标集合 + 全部子集合一起标星。
+#
+# v5.2.21 — 格内追加入口（弹窗列表每行尾加 ＝）
+#
+#   一格挂多个集合时只有 ✕ 能摘、列表行点击是整格替换，「怎么把集合加
+#   进去」没有入口（append 分支 v5.1 就有，UI 没接）。列表每行尾补 ＝：
+#   点行 = 整格替换（原行为），点 ＝ = 追加进这一格；append 时清掉空成员。
+#
+# v5.2.20 — Blender 5.x 子集合全漏（根修，Eldreda_Sunbringer 实测）
+#
+#   Blender 5.x 把 armature.collections 改成只含**顶层**集合，collections_all
+#   才是完整列表 —— Eldreda 的 Fingers / Arm.L (IK) / Hair 及其子级等 33 个
+#   子集合被整套漏掉：弹窗只剩 Extras/Root、自动填充填不上、.get("Fingers")
+#   也查不到。全部访问统一走 _colls() / _coll_get()（4.x 回退 collections）。
+#   顺带：弹窗「内部集合」段按用户要求撤掉（v5.2.19 的补丁，病根已除）。
+#
+# v5.2.19 — 指定集合弹窗「明明有集合却没东西」（Eldreda_Sunbringer 实测）
+#
+#   1. 内部集合（ORG/MCH/DEF/WGT）之前算出来却整个不画：成品骨架弹窗里
+#      只剩 Extras/Root，712 根骨的集合一个都看不见。现在在常规集合之后
+#      补一段「内部集合（机制 / 变形骨）」，最多 4 行、多的提示用过滤框。
+#   2. 一个 blend 里好几套骨架（元骨 + 成品骨 + 表情骨）时，弹窗绑的是谁
+#      不挑明 —— 绑错了用户只会觉得「有集合怎么弹窗没东西」。多于一套
+#      骨架时弹窗顶部加一行「骨架：xxx」；pie_rig 兜底挑多根时优先取
+#      配置过饼（data 里有 cn_* 记号）的那套。
+#
+# v5.2.16 — SystemError 刷屏根修（静默异常冲刷）+ 指定集合不再「粘住上一次」
+#
+#   1. 滚轮切骨骼报 "returned a result with an exception set"：Blender 5.x 的
+#      个别 RNA 写入会静默挂异常不抛（try/except 接不住），下一个无关的
+#      .get() 就炸。新增 _error_wash()（raise+except 等价 PyErr_Clear），
+#      在模态滚轮切骨/切集合、导航操作符入口、remember_scope 写入后冲刷。
+#   2. 指定集合弹窗「点过一次集合后，之后点别的集合永远写同一个」：侧栏/饼
+#      菜单按钮只设 slot/layer，其余属性继承会话残留（from_popup=True +
+#      collection=上次点的集合 → 直接走 execute 不弹窗）。collection /
+#      append / remove / from_popup 全部改 SKIP_SAVE，调用点再显式清一遍。
+#
+# v5.2.15 — ARP 滚轮不再切进看不见的另一套控制器 + 模态切换容错 + 弹窗后刷新
+#
+#   1. ARP 骨架 FK 态滚轮切到看不见的 c_hand_ik.r：keep_all 分支现在也按
+#      当前 IK/FK 模式跳过相反那套（模式标记按名字认，与可见性无关）；
+#      当前骨被滤掉或滤空时退回全表，Anby 的「被 H 的 FK 骨」照样完整轮。
+#   2. 旋转/移动模态里滚轮切骨骼/切集合抛异常 → 原来一路冒到 modal() 兜底，
+#      整个模态被踢掉；现在局部捕获，报「切换失败（模态继续）」。
+#      非模态导航 op 同样包了 try，不再往信息栏甩 SystemError 原文。
+#   3. 指定集合弹窗点完写入后 tag_redraw 视口侧栏：格子其实写进去了，
+#      但面板不重绘一直停在（空），看起来像没生效，只能反复重开弹窗。
+#
+# v5.2.14 — 指定集合弹窗补回「这一格」小节（+N 到底挂了谁，可单个摘除）
+#
+#   v5.2.10 瘦身时把「格内顺序」删过头了：一格挂多个集合（侧栏显示
+#   「躯干 +2」）时，弹窗里完全看不出多挂的是哪两个。现在弹窗顶部列出
+#   本格全部成员（① = 点进去先选中的那个，后面每行带 ✕ 可单独摘除），
+#   execute 加 remove 分支：只摘一个、其余成员保留。
+#
+# v5.2.13 — 开关属性哪一端是 IK，改成按驱动器实测（Anby 判反的根因）
+#
+#   用户报障：模型明明是 FK 态，插件却判成 IK，按「→ FK」反而切回 IK。
+#   实测（移动 IK_Hand.L / FK_Hand.L 看 ORG-Hand.L 跟谁）：
+#     Arm_IK-FK.L = 0.0 → FK 驱动，= 1.0 → IK 驱动。
+#   也就是这颗开关是「IK 量」，而作者自己的按钮 `sanby_rig.ik_fk_arm`
+#   （写着 IK > FK）写的是 1.000 —— 按钮文字和真实语义正好相反。v5.2.10
+#   拿按钮文字当语义硬写 fk=1/ik=0，于是四个肢体全判反。
+#   修法：从**驱动器**读，不信任何标签 —— 找被这个属性驱动的约束，看它
+#   COPY 的来源骨是 IK 骨还是 FK 骨（MCH-IK_Hand.L / FK_Hand.L），再用
+#   表达式算属性 0 / 1 时它的影响值，影响大的那端就是真正干活的那端。
+#   Rigify 的 IK_FK（1=FK，驱动器写 1-var）照样算得出 1=FK，不会被翻掉；
+#   手指的 FK_IK（1=IK）也对得上。读不出来才退回默认值。
+#   实测：Anby 四肢判成 手臂 FK / 腿 IK，与文件实际驱动一致；切到 IK 后
+#   移 IK_Hand 手跟 35.9 mm、移 FK_Hand 不动，切到 FK 后反过来；Dialyn
+#   Rigify 端值仍 1=FK，14/14 往返与导航不变。
+#
+# v5.2.12 — IK/FK 显隐改成「切骨骼集合」+ 往返切换不再被 twist 骨卡死
+#
+#   用户报障：切换本身对了，但「IK/FK 那套控制器的显示与隐藏」又坏了 ——
+#   另一套还留在视图里 / 该出来的没出来。
+#   复现（Anby + Dialyn 两个骨架都对得上）：显隐只写了 `bone.hide`，可这两
+#   类绑定真正决定控制器出不出现的是**集合可见性** ——
+#   Anby 是 `IK_Arm.L` / `FK_Arm.L`，Rigify 是 `Arm.L (IK)` / `Arm.L (FK)`。
+#   逐根 hide 的问题：
+#     ① 另一套藏不干净：同集合里的 `VIS-…` 替身骨、`Elbow_Pin`、`IK_Palm`、
+#        `Arm_Parent` 根本不在控制器名单里，照样挂在视图上；
+#     ② 该出的出不来：目标那套的集合若关着（Anby 存盘时 `IK_Arm.L` 就是关的），
+#        把 hide 清掉也什么都看不见。
+#   修法：按集合名里的 IK/FK 标记配对 → 关一套、开一套（开的时候连祖先集合
+#   一起打开）；没有配对集合（控制器都堆在一个集合里）才退回逐根 hide。
+#   另外：集合开着、骨却被单根 H 过的（Anby 的 `FK_Upperarm.L` 就是），
+#   顺手清掉 —— 带 `VIS-` 替身的机制骨不动，那是作者刻意藏的。
+#
+#   顺手修掉一个往返 bug：IK→FK→IK 之后第二次 IK→FK 必报「转 77°」拒绝切换。
+#   元凶是量测集里的 `ORG-ForearmTwist01.L`：IK 与 FK 用两套扭量分配，这根
+#   补偿骨来回切一次就差 77°，可手的位置只差 5 mm、蒙皮一模一样。
+#   量测集现在剔掉 twist / stretch / bend 补偿骨。
+#   实测：Anby 左臂往返 4 轮全 FINISHED；FK 三根全显、IK 三根全隐；
+#   Dialyn 14/14 往返 + 8 个集合全循环；导航不变。
+#
+# v5.2.11 — 集合滚轮完整轮每一根（大臂轮不到的真因）+ 实测收紧
+#
+#   用户报障（Anby）：FK_Arm.L 三根 FK 排好序，滚轮就是轮不到大臂，
+#   控制台连按 NEXT 全部「成功」但选择原地不动。
+#   复现：大臂被 rig 脚本 H 隐藏（IK 态藏 FK），可见性过滤把它裁出列表
+#   剩 2 根 —— v5.2.9 的兜底阈值是「剩<2 才回退」，剩 2 根正好漏网。
+#   而且 cur 一旦落在这 2 根里，连「cur 被踢掉」的信号都没有。
+#   修法（一步到位）：**集合导航一律不做可见性/模式裁剪**（keep_all），
+#   成员该完整轮；隐藏骨选中由 select_bone 自动显示兜住（v5.2.9 已有）。
+#   可见性过滤只留给全局列表；另加「cur 被裁掉就整表兜底」给全局路径。
+#   实测：Anby FK_Arm.L 正反完整轮 3 根；Dialyn 8 个集合全循环 + IKFK
+#   14/14；全局导航过滤行为不变。
+#
+# v5.2.10 — IK/FK 认得游戏系自定义绑定 + 指定集合弹窗砍到最小 + 修嵌套弹窗
+#
+#   用户报障（RIG - Anby_SoldierZero_1.11，SAnby_Rigui 绑定）：
+#   ① 明明有 IK/FK，切换却说「这套骨架没有 IK/FK」。根因：这类的开关
+#      属性叫 Arm_IK-FK.L / Leg_IK_FK.R、挂在 PROPERTIES 属性骨上，
+#      snap 按钮是作者自己写的 sanby_rig.ik_fk_arm（带 side 参数、自带
+#      矩阵吸附）——Rigify 标准识别和结构兜底都认不出。
+#      新增第四条识别路：开关属性按「ik 在前 fk 在后 + 可带部位前缀和
+#      .L/.R 后缀」认；snap 按钮直接扫 rig_ui 文本里的 bl_idname
+#      （ik_fk_* = 切到 FK，fk_ik_* = 切到 IK），注册成功的归到对应肢体。
+#      配套：原生 snap 调用不再写死 bpy.ops.pose；无 ORG/DEF 的前缀式
+#      骨名量测集回退到最近变形骨（不然吸附必动控制器，位移全是假阳性）。
+#   ② 指定集合弹窗砍到最小：只剩「过滤框 + 本骨架集合列表 + 清空」，
+#      预设新建 / 内部集合 / 格内顺序 / 整格换位全删（新建集合按 M 就行）。
+#   ③ 修嵌套弹窗：弹窗里点任何一行都走 invoke() 又开一层新窗（叠三层
+#      就是它）。from_popup 的调用现在直接落 execute，点完写入并关窗。
+#
+# v5.2.9 — 滚轮死修掉（隐藏骨不该卡死导航）+ 指定集合弹窗改紧凑可搜索
+#
+#   用户报障（RIG - Anby_SoldierZero）：FK_Arm.L 三个 FK 控制器排好了
+#   集合顺序，滚轮就是切不动。根因：rig 脚本在 IK 态把 FK 骨 H 隐藏，
+#   filter_nav_names 的「跳过隐藏」把 3 根过滤得只剩 1 根 —— 排序再好
+#   也只能在 1 根里打转。审计同款文件还发现 Root 集合（4 根藏 3 根）同病。
+#
+#   ① filter_nav_names 兜底：过滤后剩不到 2 根而原始列表 ≥ 2 根时，
+#      退回原始列表 —— 用户显式维护的集合不因隐藏缩水。
+#      顺序：先恢复完整顺序表，可见骨会先被选中（过滤在前的行为不变）。
+#      ↑↓ / 滚轮循环 / 旋转模态滚轮 / 跳集合选第一根全走这一个函数，一处修全修。
+#   ② select_bone：目标骨被单独 H 隐藏时顺手显示（只动 bone.hide，
+#      不动集合可见性）—— 否则滚到隐藏骨，视图飞过去空无一物。
+#   ③ 指定集合弹窗改 invoke_popup 定宽小窗 + 关键字过滤：列表最多 12 行，
+#      内部集合输入 mch/org/def 才展开；点完自动关窗。Anby 46 个集合
+#      不再把整屏铺满。
+#
+# v5.2.8 — 星标饼响应速度对齐原生饼 + 饼形态可在偏好里调
+#   · 命中判定不再要求滑进格子环：只看方向，离饼心超过「触发死区」
+#     （默认 12 px，跟原生饼十几像素就高亮一致）就选中那一格；
+#     中心孔只影响外观。拖太远（超出星标外沿）算放弃，不误选。
+#   · 中心孔里加一层半透明方向扇：方向一给出就有反馈，不用等滑到格子上。
+#   · 偏好 > 驭骨 > 星标饼：触发死区 / 饼半径 / 中心孔 / 星标大小 / 字号
+#     五项可调，画与命中判定共用同一份参数。
+#
+# v5.2.7 — 星标饼：复刻原生饼手势（滑动高亮 / 松手选中 / 星星独显）
+#   用户定稿的手势（一套拖拽里完成，松手即退出饼）：
+#     · 按住 Alt+左键滑到格子上 → 高亮；松手 → 立刻跳进这个集合
+#       （选集合顺序第一根 / 自己指定的骨骼），饼自动关掉。
+#     · 滑到星星上 → 当场独显这个集合（预览）；从星星滑回格子上 →
+#       退出独显；松手在星星上 → 独显定格；松手在格子上 → 跳集合。
+#     · 点到空格子 / 拖出饼外松手 → 直接关掉，绝不弹「指定集合」大面板
+#       （给格子指集合依旧走侧栏面板），饼底提示小字也删了。
+#
+# v5.2.6 — 星标饼去悬停独显 + 骨骼顺序只留点选排序
+#   · 星标饼：删掉「悬停临时独显」（悬停会闪独显，用户不需要；
+#     点 ★ 独显、点格子进集合、滚轮切层、右键取消，就这四个动作），
+#     solo_hover 偏好一并删除，pie_custom 默认开。
+#   · 骨骼顺序：链式收录 / 框选排序 / 按编号展开 / 反转 / 按名排序
+#     的按钮全下掉，只留「点选排序」：点一下开始 → 正常加选（谁被点
+#     谁排后面）→ 点回来写入。用 0.12s 后台计时器盯活动骨骼记录先后
+#     （Blender 不保存选中顺序），不再是模态。
+#
+# v5.2.5 — 星标开关挪进偏好（原来只在侧栏饼菜单块里，找不到）
+#   · 编辑 > 偏好 > 插件 > 驭骨 新增「星标独显（饼菜单 / 集合行）」一节：
+#     星标饼（自绘）+ 悬停独显两个开关都在这里，并写明侧栏集合行也有「独显」
+#
+# v5.2.4 — 集合内骨骼顺序（批量收录）+ IK/FK 通用化 + 饼菜单星标独显
+#
+#   ① 骨骼顺序：集合顺序不再只能听 assign 的先后。
+#      面板「骨骼顺序」块里可以一根一根上下挪，也可以批量写：
+#        · 链式收录   —— 选链头，沿父子一路收到底（头发那种长串一次搞定）
+#        · 框选排序   —— 乱序框一堆，按「父先于子 + 编号自然序」自动排
+#        · 按编号展开 —— hair_fk.001 → 同前后缀的 001..00N
+#        · 点选排队   —— 一根一根点，按点选先后写（Blender 不保存选中顺序，
+#                        所以用模态自己记：Enter 写入 / Backspace 退一个）
+#      顺序存在 rig.data["cn_boneord_<集合>"]，随 .blend 保存；只作用于
+#      滚轮 / ↑↓ 的导航先后，不改集合成员。
+#
+#   ② IK/FK 通用化：以前只认 rig_ui.py 里的按钮参数。自定义绑定常见的
+#      「Rigify 生成后大改、UI 脚本被删、rig_id 对不上」会一根肢体都认不出来。
+#      现在三级识别：
+#        · rig_ui 按钮参数（原生 snap，最准）
+#        · rig_id 丢失时从 UI 文本里反推 rig_id 再解析
+#        · 结构兜底：按「带 IK_FK / FK_IK 属性的开关骨 + 同侧同部位词 +
+#          _fk/_ik 标记」认肢体，没有原生 snap 就走自算快照
+#      实测：全新 Rigify metarig 生成的骨架 16/16 通过；删掉 UI 文本后
+#      仍能认出 4 条肢体并切换（位移 0.0 mm）。
+#
+#   ③ 星标独显：集合行 / 饼菜单配置区每格后面都有星标按钮，点一下只显示
+#      这个集合的控制器，再点一次还原（快照存在骨架里，重开文件也能还原）。
+#      原生饼菜单只在松开鼠标时响应点击、**拿不到悬停事件**，所以「鼠标移
+#      上去就独显」只能自己画：偏好（或侧栏饼菜单块）勾「星标饼（自绘）」后，三个热键改开
+#      自绘饼，每格外沿一个星标，悬停/点击都行（悬停独显可单独关掉）。
+#      自绘饼画不出来（老显卡 / API 变动）会自动退回原生饼，键位不受影响。
+#
+# v5.2.3 — IK/FK 在 Dialyn-琉音 / AzuralRig 上彻底切不动：三处根因
+#
+#   用户报障：这份骨架（795 骨，Rigify 系，27 个集合）上选中任一控制器按
+#   Alt+I，14 根肢体全部回一句「这套姿势切不过去」，原地卡在 FK 里。
+#   实测（AzuralRig，手臂 FK 摆 20°/40°/60°）定位到三个独立的错：
+#
+#   ① _snap_pole 把**真正的 IK 目标**当成了 pole 挪走。
+#      判据原来是「名字里带 target 或 pole」，于是 `upper_arm_ik_target.L`
+#      被挪 223.7 mm、`thigh_ik_target.L` 被挪 840.2 mm —— 而这两根正是
+#      约束 pole_subtarget 与 MCH 链的驱动骨。挪完之后无论走原生 snap 还是
+#      自算快照，读到的都是坏状态。自算 24 mm、原生 105 mm 全从这里来。
+#      → 现在只认约束上真实的 pole_subtarget（_pole_targets），
+#        并且挪 pole 一律放到翻完开关之后（_pole_optimize）：
+#        转 7 个方向量中段误差，压不下来就整根还原。
+#
+#   ② 原生「FK->IK」按钮的方向和标签相反。
+#      这颗 generic_snap 的 props 是 output = FK 骨、input = IK 链，而 rig_ui
+#      的通用快照是「读 input、写 output」——  一按就把摆好的 FK 姿势抹回 rest
+#      （实测手飞 393 mm），随后再翻开关，等于把姿势整个丢掉。
+#      → _native_call() 按 output_bones 反查方向，方向对不上就当没有原生可用。
+#
+#   ③ 判定量的是整根骨架 795 根骨。
+#      任何一根头发/另一条手臂的骨头转 15.1°，手已经对齐的切换也判失败。
+#      → 判定只看这条肢体自己的变形骨（_limb_deform_names），
+#        并加一档「照切但提示」：肢体位移 ≤ 6 cm、转角 ≤ 30°、全身 ≤ 12 cm
+#        就照切（手/脚实测对到 0.0 mm），把残差写进结果，而不是让用户卡死。
+#
+#   验收（AzuralRig，14 根肢体 × 两个方向，摆姿 + 静置）：见随包说明。
+#
 # 这一版四件事：
 #
 # ① IK/FK 切换（新）。选中 IK 或 FK 控制器，按一下键就切到另一边，并自动把
@@ -691,7 +968,7 @@
 bl_info = {
     "name": "驭骨 · BonePilot",
     "author": "默尔佐",
-    "version": (5, 0, 4),
+    "version": (5, 2, 26),
     "blender": (5, 2, 0),
     "location": "Pose Mode > N 面板 > Nav",
     "description": "驭骨 · BonePilot：按集合导航控制器，快速旋转/移动，逐段撤销，让动画操作跟手",
@@ -765,6 +1042,67 @@ def get_prefs():
 def pref(name, default):
     p = get_prefs()
     return getattr(p, name, default) if p else default
+
+
+class _ErrWash(Exception):
+    pass
+
+
+def _error_wash():
+    """清掉 C 层「悄悄挂上但没抛出」的异常状态（等价 PyErr_Clear）。
+
+    Blender 5.x 实测：个别 RNA 写入（pb.hide / keyframe_insert 这类）失败时
+    会把错误状态留在解释器里却不抛 Python 异常 —— 周围的 try/except 根本
+    接不住，然后下一个毫不相干的 bpy_prop_collection.get() 就报
+    SystemError "<built-in method get of bpy_prop_collection ...>
+    returned a result with an exception set"。主动 raise 一个自己的异常
+    再接住，错误指示器就被清干净了；没有残留时这一下零开销。
+    """
+    # 真正的 PyErr_Clear：raise/except 不一定能清掉 C 层
+    # 已经挂起但没有 Python 异常对象的错误状态。
+    try:
+        import ctypes
+        ctypes.pythonapi.PyErr_Clear()
+        return
+    except Exception:
+        pass
+    try:
+        raise _ErrWash
+    except _ErrWash:
+        pass
+
+
+def _bone_get(rig, name):
+    if rig is None:
+        return None
+    _error_wash()
+    try:
+        return rig.data.bones.get(name)
+    except SystemError:
+        _error_wash()
+        try:
+            return rig.data.bones.get(name)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _pb_get(rig, name):
+    """带 C 错误冲刷的 pose bone 查找，防止 SystemError 毒化后续 get。"""
+    if rig is None:
+        return None
+    _error_wash()
+    try:
+        return rig.pose.bones.get(name)
+    except SystemError:
+        _error_wash()
+        try:
+            return rig.pose.bones.get(name)
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- 自定义键位
@@ -1229,10 +1567,21 @@ def book_key_label():
 # ---------------------------------------------------------------- 选中
 
 def select_bone(rig, bone_name, extend=False):
-    """选中骨骼。extend=False 单选，extend=True 加选。"""
-    pb = rig.pose.bones.get(bone_name)
+    """选中骨骼。extend=False 单选，extend=True 加选。
+
+    v5.2.9：目标骨被单独 H 隐藏时顺手显示出来 —— 滚轮兜底会走到隐藏骨
+    （见 filter_nav_names 的回退），不显示的话视图飞过去却空无一物，
+    用户只会更懵。集合可见性不动，只动骨骼自己的 hide。
+    """
+    pb = _pb_get(rig, bone_name)
     if pb is None:
         return False
+    try:
+        if pb.bone.hide or pb.hide:
+            pb.bone.hide = False
+            pb.hide = False
+    except Exception:
+        pass
     if not extend:
         for p in rig.pose.bones:
             p.select = False
@@ -1786,6 +2135,7 @@ def remember_scope(rig, name):
             rig.data["cn_scope"] = name
     except Exception:
         pass
+    _error_wash()   # v5.2.16：自定义属性写入也可能静默挂异常
 
 
 # ---------------------------------------------------------------- 空间排序
@@ -1942,13 +2292,14 @@ def collection_bone_names(rig, col):
     """集合内的骨骼名（手指集合按拇指→小指，其余按空间排序或 assign 顺序）。"""
     if col is None:
         return []
-    names = [b.name for b in col.bones if rig.pose.bones.get(b.name) is not None]
+    names = [b.name for b in col.bones if _pb_get(rig, b.name) is not None]
 
     mode = collection_sort_mode(rig, col)
     if mode == 'HIERARCHY':
         return hierarchy_names(rig, col)
     if mode == 'ASSIGN':
-        return names
+        # 「集合顺序」= 面板里排过的自定义顺序优先，没排过就是 assign 原序
+        return ordered_bone_names(rig, col.name, names)
     if mode == 'FINGER':
         if any(finger_rank(n) < 99 for n in names):
             names.sort(key=lambda n: (finger_rank(n), natural_key(n)))
@@ -1957,6 +2308,181 @@ def collection_bone_names(rig, col):
         names.sort(key=lambda n: bone_key(rig, n), reverse=True)
         return names
     return names
+
+
+# ---------------------------------------------------------------- 集合内骨骼顺序
+#
+# v5.2.4：集合顺序不再只能听 assign 的。面板里能一根一根上下挪，也能批量写：
+#
+#   · 链式收录   —— 选链头，沿父子一路收到底（头发那种一连串控制器最省事）
+#   · 框选排序   —— 乱序框一堆，按「父先于子 + 编号自然序」自动排
+#   · 按编号展开 —— hair_fk.001 → 同前后缀的 001..00N 一次排好
+#   · 点选排队   —— 一根一根点，按点选的先后写（Blender 自己不给选中顺序）
+#
+# 顺序存在 rig.data 的 `cn_boneord_<集合名>`（字符串数组），随 .blend 保存。
+# 没进表里的骨骼按原来的相对次序跟在后面 —— 加骨、删骨都不会把顺序弄乱。
+
+_BONE_ORDER_PREFIX = "cn_boneord_"
+_ORDER_INTERNAL_RE = re.compile(r"^(ORG|MCH|DEF|VIS|WGT|IK|FK)[-_]", re.I)
+
+
+def bone_order_key(col_name):
+    return _BONE_ORDER_PREFIX + (col_name or "")
+
+
+def bone_order(rig, col_name):
+    """这个集合自定义过的骨骼顺序；空列表 = 没排过。"""
+    if rig is None or not col_name:
+        return []
+    try:
+        raw = rig.data.get(bone_order_key(col_name), None)
+    except Exception:
+        return []
+    if not raw:
+        return []
+    try:
+        return [str(n) for n in raw]
+    except Exception:
+        return []
+
+
+def set_bone_order(rig, col_name, names):
+    """写自定义顺序；传空列表就删掉，回到 assign 原序。"""
+    if rig is None or not col_name:
+        return False
+    key = bone_order_key(col_name)
+    try:
+        if names:
+            rig.data[key] = [str(n) for n in names]
+        elif key in rig.data:
+            del rig.data[key]
+        return True
+    except Exception:
+        return False
+
+
+def ordered_bone_names(rig, col_name, names):
+    """按自定义顺序重排；不在表里的保持原相对次序排在后面（sorted 稳定）。"""
+    names = list(names)
+    order = bone_order(rig, col_name)
+    if not order:
+        return names
+    rank = {}
+    for i, n in enumerate(order):
+        rank.setdefault(n, i)
+    big = len(order)
+    return sorted(names, key=lambda n: rank.get(n, big))
+
+
+def bone_order_is_custom(rig, col_name):
+    return bool(bone_order(rig, col_name))
+
+
+def collection_members(rig, col):
+    """集合里的骨骼名（去掉孤立的、骨架里已经不存在的）。"""
+    if col is None:
+        return []
+    return [b.name for b in col.bones if rig.pose.bones.get(b.name) is not None]
+
+
+def order_chain_names(rig, col, roots):
+    """从链头沿父子关系一路收：表里只放集合成员，但中间跳过非成员骨继续走。
+
+    这样「一根头发分在两个集合里」也能接上；同层多子级时按编号自然序走，
+    所以 hair_fk.002 不会排到 hair_fk.010 后面去。
+    """
+    members = set(collection_members(rig, col))
+    out, seen = [], set()
+
+    def walk(name, depth):
+        if name in seen or len(out) >= 800 or depth > 96:
+            return
+        seen.add(name)
+        if name in members:
+            out.append(name)
+        b = rig.data.bones.get(name)
+        if b is None:
+            return
+        kids = [c.name for c in b.children if c.name not in seen]
+        kids.sort(key=natural_key)
+        for k in kids:
+            if _ORDER_INTERNAL_RE.match(k):
+                continue
+            walk(k, depth + 1)
+
+    for r in roots:
+        walk(r, 0)
+    return out
+
+
+def order_topology_names(rig, col, names):
+    """一堆骨骼按「父先于子」排：框选也能排出 1→N 的顺序。"""
+    selset = set(n for n in names if n)
+    roots = []
+    for n in selset:
+        b = rig.data.bones.get(n)
+        if b is None:
+            continue
+        par = b.parent.name if b.parent is not None else None
+        if par is None or par not in selset:
+            roots.append(n)
+    roots.sort(key=natural_key)
+    out, seen = [], set()
+
+    def walk(name):
+        if name in seen or len(out) >= 800:
+            return
+        seen.add(name)
+        out.append(name)
+        b = rig.data.bones.get(name)
+        if b is None:
+            return
+        for c in sorted([c.name for c in b.children
+                         if c.name in selset and c.name not in seen], key=natural_key):
+            walk(c)
+
+    for r in roots:
+        walk(r)
+    for n in sorted(selset - seen, key=natural_key):      # 环/孤点兜底
+        out.append(n)
+        seen.add(n)
+    return out
+
+
+_ORDER_NUM_RE = re.compile(r"^(.*?)(\d+)(\D*)$")
+
+
+def order_series_names(rig, col, seed):
+    """hair_fk.001 → 同前后缀的整条编号序列，按数字大小排。"""
+    m = _ORDER_NUM_RE.match(seed or "")
+    if not m:
+        return []
+    head, tail = m.group(1), m.group(3)
+    found = []
+    for n in collection_members(rig, col):
+        mm = _ORDER_NUM_RE.match(n)
+        if mm and mm.group(1) == head and mm.group(3) == tail:
+            found.append((int(mm.group(2)), n))
+    found.sort()
+    return [n for _i, n in found]
+
+
+def order_merge(rig, col, head_names):
+    """把新排的一段放到最前，其余成员按当前顺序跟在后面（不丢骨）。"""
+    head = [n for n in dict.fromkeys(head_names or []) if n]
+    rest = [n for n in collection_bone_names(rig, col) if n not in set(head)]
+    return head + rest
+
+
+def write_bone_order(rig, col, names, report=None):
+    """落盘顺序 + 顺手把排序模式切到「集合顺序」（不然会被空间排序盖掉）。"""
+    if set_bone_order(rig, col.name, names):
+        if collection_sort_mode(rig, col) != 'ASSIGN':
+            set_collection_sort_mode(rig, col, 'ASSIGN')
+        return True
+    if report is not None:
+        report({'WARNING'}, "这根骨架是只读的，改不了顺序")
+    return False
 
 
 # ---------------------------------------------------------------- 可见 / IK-FK 过滤
@@ -2123,7 +2649,7 @@ def rig_switch_mode(rig, bone_name, col_name=""):
     arm, leg = _switch_candidates(side)
     order = leg + arm if limb == "leg" else arm + leg
     for n in order:
-        pb = rig.pose.bones.get(n)
+        pb = _pb_get(rig, n)
         if pb is None:
             continue
         mode = _read_switch(pb)
@@ -2317,13 +2843,49 @@ def pie_group_collections(rig, used):
     return out
 
 
+
+def _arm_of(rig):
+    """rig 传 Object 或 Armature 数据块都行，统一拿 Armature。"""
+    return rig.data if getattr(rig, "type", None) == 'ARMATURE' else rig
+
+
+def _colls(rig):
+    """全部骨骼集合（**含子集合**）。Blender 5.x 把 collections 改成
+    只含顶层 —— Eldreda 的 Fingers / Arm.L (IK) / Hair 子级等 33 个
+    子集合就是这么被漏掉的；collections_all 才是完整列表。
+    4.x 没有 collections_all，回退 collections（那时它就是全部）。"""
+    ar = _arm_of(rig)
+    allc = getattr(ar, "collections_all", None)
+    return allc if allc is not None else ar.collections
+
+
+def _coll_get(rig, name):
+    """按名字取集合：顶层走快速 .get，子集合在 collections_all 里找。"""
+    if not name:
+        return None
+    ar = _arm_of(rig)
+    try:
+        c = ar.collections.get(name)
+    except Exception:
+        c = None
+    if c is not None:
+        return c
+    try:
+        for c in ar.collections_all:
+            if c.name == name:
+                return c
+    except AttributeError:
+        pass
+    return None
+
+
 def pie_usable_collections(rig):
     """饼菜单/列表里能选的集合：有骨骼、且不是 MCH 那类内部集合。"""
     out = []
     if rig is None or getattr(rig, "type", None) != 'ARMATURE':
         return out
     try:
-        for c in rig.data.collections:
+        for c in _colls(rig):
             if not len(c.bones):
                 continue
             if _INTERNAL_COLL_RE.match(c.name):
@@ -2363,7 +2925,7 @@ def assign_collection_rows(rig):
     if rig is None or getattr(rig, "type", None) != 'ARMATURE':
         return native, internal
     try:
-        cols = list(rig.data.collections)
+        cols = list(_colls(rig))
     except Exception:
         return native, internal
     for c in cols:
@@ -2381,7 +2943,7 @@ def missing_preset_rows(rig):
     """偏好预设里、这根骨架还没有的集合 —— 点了会现场新建。"""
     out = []
     try:
-        have = set(c.name for c in rig.data.collections) if rig else set()
+        have = set(c.name for c in _colls(rig)) if rig else set()
     except Exception:
         have = set()
     for name in preset_names():
@@ -2395,6 +2957,626 @@ def pie_is_initialized(rig, layer=1):
         return bool(rig.data.get(pie_init_key(layer), 0))
     except Exception:
         return False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 原生集合自动归类（v5.1）
+#
+# 需求原话：「读取一个没动过的任何绑定，把它默认有的那些集合归类到插件
+# 自己的集合里」。所以三层饼不再靠偏好里那 8 个硬编码中文名去凑，而是
+# 直接读 _colls(rig)，判断每个集合属于哪个部位、哪个变体。
+#
+# 三条独立证据，按可靠性排：
+#   ① 名字词典（中/英，词长降序）—— 认出九成以上，连一根骨骼都没有的空
+#      集合也能认（Rigify 的 Arm.L (FK) 剥掉 (FK) 就是 Arm.L，这一条直接
+#      治好了「空 FK/Tweak 集合永远上不了饼」的老毛病）；
+#   ② 变体后缀 —— (Tweak)/(Extra) 进附属饼、(Detail) 进细节饼、(FK)/(IK)
+#      跟着身体部件进主饼；
+#   ③ 几何质心 —— 名字认不出时兜底判部位，名字缺侧别时定左右。
+#
+# 左右约定**实测过**（这几个 rig 的 .L 都在 +X、.R 都在 -X）：
+#   Arm.L (IK) cx=+0.3144   Arm.R (IK) cx=-0.3111
+#   Leg.L (IK) cx=+0.0601   Leg.R (IK) cx=-0.0601
+# 腿的 |x| 只有 0.06（包围盒半宽 0.56），阈值所以放到 0.05 —— 给 0.12
+# 的话左右腿永远判不出侧。
+# ══════════════════════════════════════════════════════════════════════════
+
+# 部位词按「优先级」排：越靠前越可信（torso 比 root 更像躯干）。
+_COLL_PART_WORDS = (
+    ('HAND',  ('手指', '手掌', '手', '指', 'fingers', 'finger', 'hand',
+               'palm', 'thumb', 'index', 'middle', 'ring', 'pinky')),
+    ('ARM',   ('上臂', '前臂', '手臂', '肩', '臂', 'upperarm', 'forearm',
+               'shoulder', 'arm', 'elbow')),
+    ('LEG',   ('大腿', '小腿', '脚', '腿', '膝', 'thigh', 'shin', 'calf',
+               'foot', 'knee', 'toe', 'leg')),
+    ('HEAD',  ('脖子', '脑袋', '头', '颈', '眼', '牙', '舌', 'facerig',
+               'face', '脸', 'head', 'neck', 'eye', 'jaw', 'tongue', 'teeth')),
+    ('TORSO', ('躯干', '身体', '腰', '胸', '背', '脊', 'torso', 'spine',
+               'chest', 'body', 'hip', 'pelvis', 'waist', 'root', '根部')),
+    # 尾巴 / 翅膀 / 耳朵这类非人体主干，认得出来但主饼没它们的位子，
+    # 会走「部位有值但没槽位」那条路下沉到细节饼。排在最后 = 优先级最低。
+    ('TAIL',  ('尾巴', '尾', 'tail')),
+)
+
+# (词, 部位, 优先级)：优先级 = 在原始表里的顺序，小的更可信。
+_COLL_WORDS = []
+_RANK = 0
+for _k, _ws in _COLL_PART_WORDS:
+    for _w in _ws:
+        _COLL_WORDS.append((_w.lower(), _k, _RANK))
+        _RANK += 1
+# 匹配时词长的先试：「手指」不能被「手」抢走，「手臂」不能被「手」抢走。
+_COLL_WORDS.sort(key=lambda p: -len(p[0]))
+
+# 变体标记**只能**出现在括号里、名字末尾、或者 TWK_ 前缀。
+# v5.1 修：原来用 `\b(extra)\b`，把 `Extra COGs`（额外的重心控制器）
+# 误判成 Extra 变体塞进了附属饼 —— 那里的 Extra 是形容词，不是后缀。
+# 另外单独放行「整个名字就叫 Tweaks」这一种（Rigify 的修形集合）。
+# v5.2.23 补：SAnby 系（Anby / Ju_Fufu / Trigger）的修形集合是 TWK_ 前缀
+#   （TWK_Arm.L / TWK_Leg.R），以前变体认不出 → 当 BODY 挤进细节饼，
+#   把 Hair / Accessories 那些真细节挤到一格两个。前缀认出来走附属饼。
+_COLL_VARIANT_RE = re.compile(
+    r"[\[（(]\s*(tweak|detail|extra|parent|fk|ik)\s*[\]）)]"
+    r"|[/_\-\s](tweak|detail|extra|parent|fk|ik)s?\s*$"
+    r"|^\s*(tweaks?)\s*$"
+    r"|^\s*twk[\s_\-]",
+    re.I)
+
+_COLL_SIDE_L = re.compile(r"(\.l$|\.l\b|_l$|_l\b|^l_|\bleft\b|左)", re.I)
+_COLL_SIDE_R = re.compile(r"(\.r$|\.r\b|_r$|_r\b|^r_|\bright\b|右)", re.I)
+
+# 变体 → 去哪一层
+_VARIANT_LAYER = {'BODY': 1, 'DETAIL': 2, 'TWEAK': 3}
+
+# 内部 / 工具集合：不上饼、不进候选。
+# AniMate 的 Deform（44 根全变形骨）和 Reference（66 根纯参考骨）名字
+# 不带 MCH/DEF 前缀，靠名字 + 「一根有形状的都没有」两道判据兜住。
+_INTERNAL_COLL_NAMES = frozenset((
+    'deform', 'reference', 'internal', 'bones', 'tweak',
+    'mch', 'org', 'def', 'wgt', 'widget', 'dorm',
+))
+# 注意：`Secondary` 不在名单里 —— AniMate 的 Secondary 是 43 根带形状的
+# 辅助控制器（8 个约束目标指向它），是真给人点的一套，不是变形骨。
+
+# 只配进细节饼的集合：脸部表情那一整套（Facerig / 表情 / facial）。
+# 它们是「点开才有用」的表情控制，占掉主饼的「头」格会把真正的头部控制器
+# 挤掉 —— 用户要的是主饼只放身体部件。
+_SECONDARY_ONLY_RE = re.compile(
+    r"(facerig|face[_\- ]?rig|facial|expression|morph|shape[_\- ]?key"
+    r"|表情|面部控制|五官)", re.I)
+
+# 主饼 8 格按方位排：0 上 / 1 右上 / 2 右 / 3 右下 / 4 下 / 5 左下 / 6 左 / 7 左上
+_PART_SLOT = {
+    ('HEAD', ''): 0, ('HEAD', 'L'): 0, ('HEAD', 'R'): 0,
+    ('HAND', ''): 1, ('HAND', 'R'): 1,
+    ('ARM', ''): 2, ('ARM', 'R'): 2,
+    ('LEG', ''): 3, ('LEG', 'R'): 3,
+    ('TORSO', ''): 4, ('TORSO', 'L'): 4, ('TORSO', 'R'): 4,
+    ('LEG', 'L'): 5,
+    ('ARM', 'L'): 6,
+    ('HAND', 'L'): 7,
+}
+
+
+def _coll_variant(name):
+    """'BODY'（主饼）/ 'DETAIL'（细节饼）/ 'TWEAK'（附属饼）。"""
+    hit = _COLL_VARIANT_RE.search(name or "")
+    if not hit:
+        return 'BODY'
+    v = next((g for g in hit.groups() if g), "").lower()
+    if v in ('fk', 'ik'):
+        return 'BODY'
+    if v == 'detail':
+        return 'DETAIL'
+    return 'TWEAK'          # tweak / extra / parent
+
+
+# v5.2.23：这组名字是不是「一套 IK/FK 配对的真控制器」。
+#   括号式 `Arm.L (IK)` / 后缀式 `Torso_FK` / 前缀式 `IK_Arm.R` 都算。
+_NAME_IKFK_PREFIX_RE = re.compile(r"^\s*(ik|fk)[\s_\-]", re.I)
+
+
+def _name_has_ikfk(name):
+    hit = _COLL_VARIANT_RE.search(name or "")
+    if hit:
+        v = next((g for g in hit.groups() if g), "").lower()
+        if v in ('fk', 'ik'):
+            return True
+    return bool(_NAME_IKFK_PREFIX_RE.match(name or ""))
+
+
+def _coll_side(name):
+    s = name or ""
+    if _COLL_SIDE_L.search(s):
+        return 'L'
+    if _COLL_SIDE_R.search(s):
+        return 'R'
+    return ''
+
+
+def _coll_centroid(rig, col):
+    """集合质心（局部 X / Z）。只关心左右和高度，Y 不用。"""
+    xs, zs = [], []
+    for b in col.bones:
+        bb = rig.data.bones.get(b.name)
+        if bb is None:
+            continue
+        for p in (bb.head_local, bb.tail_local):
+            xs.append(p.x)
+            zs.append(p.z)
+    if not zs:
+        return None
+    return (sum(xs) / float(len(xs)), sum(zs) / float(len(zs)))
+
+
+def _rig_bounds(rig):
+    """整根骨架的包围盒 (minx, maxx, minz, maxz)，用来归一化。"""
+    xs, zs = [], []
+    for b in rig.data.bones:
+        xs += [b.head_local.x, b.tail_local.x]
+        zs += [b.head_local.z, b.tail_local.z]
+    if not xs:
+        return (0.0, 1.0, 0.0, 1.0)
+    return (min(xs), max(xs), min(zs), max(zs))
+
+
+def _coll_geo_part(rig, col, box):
+    """质心位置猜部位。返回 (部位, 侧别)；实在判不出返回 (None, '')。"""
+    c = _coll_centroid(rig, col)
+    if c is None:
+        return None, ''
+    minx, maxx, minz, maxz = box
+    z = (c[1] - minz) / max(1e-6, maxz - minz)
+    half = max(1e-6, (maxx - minx) / 2.0)
+    x = c[0] / half
+    # .L 在 +X、.R 在 -X（实测）。阈值 0.05 是为了让左右腿（|x|≈0.11）
+    # 也判得出来 —— 0.12 的话腿永远判不出侧。
+    side = 'L' if x > 0.05 else ('R' if x < -0.05 else '')
+    if z > 0.80 and abs(x) < 0.30:
+        return 'HEAD', ''
+    if abs(x) > 0.35:
+        return ('ARM' if z > 0.55 else 'LEG'), side
+    if z <= 0.30:
+        return 'LEG', side
+    return 'TORSO', ''
+
+
+def _constraint_targets(rig):
+    """被约束引用的骨骼名 —— 用来认「纯参考骨」集合（Reference）。"""
+    out = set()
+    try:
+        for pb in rig.pose.bones:
+            for cn in pb.constraints:
+                t = getattr(cn, 'subtarget', '')
+                if t:
+                    out.add(t)
+    except Exception:
+        pass
+    return out
+
+
+def _widget_coverage(rig):
+    """整根骨架里带自定义形状的骨骼占比。
+
+    用来判断这个 rig 到底有没有 widget：课鲁凯.blend 里的 `Klukai`
+    整根骨架 custom_shape 全是 None（append 时 widget 丢了），这种 rig
+    不能按「有没有形状」来判集合性质，会把整个 rig 判死。
+    """
+    total = shaped = 0
+    try:
+        for pb in rig.pose.bones:
+            total += 1
+            if pb.custom_shape is not None:
+                shaped += 1
+    except Exception:
+        return 0.0
+    return (shaped / float(total)) if total else 0.0
+
+
+def _shaped_ratio(rig, col):
+    """集合里有多少骨骼带自定义形状。变形骨集合这个值接近 0。"""
+    if not len(col.bones):
+        return 0.0
+    shaped = 0
+    for b in col.bones:
+        pb = rig.pose.bones.get(b.name)
+        if pb is not None and pb.custom_shape is not None:
+            shaped += 1
+    return shaped / float(len(col.bones))
+
+
+def _coll_is_internal(rig, col, targets=None):
+    """内部 / 工具集合：不上饼、不进候选。"""
+    name = (col.name or "").strip()
+    if not name:
+        return True
+    if _INTERNAL_COLL_RE.match(name):
+        return True                        # MCH- / ORG- / DEF- / WGT- 前缀
+    if name.lower() in _INTERNAL_COLL_NAMES:
+        return True                        # AniMate 的 Deform / Reference
+    if not len(col.bones) and _is_divider_collection(name):
+        return True                        # ======CLOTHES====== 纯横幅
+    # v5.2.23：空的「装饰名」集合也不吃饼位 —— Anby / Ju_Fufu 实测：
+    #   `------------` 这种纯符号分隔行、`[ ORG ]` / `[ DEF ]` 空壳标签
+    #   集合以前一路排进细节饼，白占两三格，把 Hair / Accessories 挤到
+    #   一格两个。有骨骼的不受影响（Rigify 的空 FK 集合是有意义的，
+    #   切过一次模式才有成员 —— 名字里带正常字符的一律照留）。
+    if not len(col.bones):
+        s2 = name.strip()
+        if _BRACKET_INTERNAL_RE.match(s2):
+            return True
+        if not re.search(r"[0-9A-Za-z\u4e00-\u9fff]", s2):
+            return True
+    # v5.1 删掉了原来的「一根自定义形状都没有 → 纯参考骨」判据：
+    # 课鲁凯.blend 里的 Klukai 整根骨架 custom_shape 全是 None（widget
+    # 在 append 时丢了），那条判据会把 Torso / Arm.L (IK) / Hair 全判成
+    # 内部集合，33 个集合只剩 12 个上饼。宁可放过，不可错杀 —— 认错的
+    # 进细节饼，用户点一下就能改回来。
+    return False
+
+
+# v5.2.23：ASCII 部位词改成「词边界 + 可选复数 s」匹配。
+#   原来 `w in base` 纯子串，Necklace（项链）里的 neck 命中「头」、
+#   Headphones（耳机）里的 head 也是 —— Wise_V1 实测：Necklace 靠 neck
+#   以更高的可信级抢走了主饼头格，Eyes 反而被挤进细节饼。
+#   规则：词前面不能是字母/数字（Arm.R 的 . 算边界）、后面只能是
+#   结尾 / 符号 / 数字 / 复数 s —— necklac**e**、headphon**es** 这类
+#   复合词不再命中；中文词没有词边界，保持子串匹配。
+_ASCII_WORD_RE_CACHE = {}
+
+
+def _word_in_base(w, base):
+    if not w.isascii():
+        return w in base
+    pat = _ASCII_WORD_RE_CACHE.get(w)
+    if pat is None:
+        pat = re.compile(r"(?<![a-z0-9])" + re.escape(w) + r"s?(?![a-z])")
+        _ASCII_WORD_RE_CACHE[w] = pat
+    return bool(pat.search(base))
+
+
+# v5.2.23：`[ ORG ]` / `[ DEF ]` 这种括号空壳标签集合（空的时候不上饼）
+_BRACKET_INTERNAL_RE = re.compile(r"^\[\s*(ORG|MCH|DEF|WGT)\s*\]$", re.I)
+
+
+# v5.2.23：饰品 / 配饰类名字不按部位词抢主饼格 —— 课鲁凯皮肤骨架的
+#   `Head Accessories`（头部饰品：帽子发卡）以前靠 "head" 占走主饼头格。
+#   这些是穿戴物，归细节饼（geo / unsure 路径）。
+_ACCESSORY_RE = re.compile(r"accessor|ornament|配饰|饰品|装饰", re.I)
+
+
+def classify_collection(rig, col, box=None, targets=None):
+    """一个原生集合 → (部位, 变体, 侧别, 依据, 优先级)。
+
+    部位：'HEAD' / 'TORSO' / 'ARM' / 'LEG' / 'HAND' / None
+    变体：'BODY' / 'DETAIL' / 'TWEAK'
+    侧别：'L' / 'R' / ''
+    依据：'name'（名字认出来）/ 'geo'（靠位置猜）/ ''
+    优先级：命中词在词表里的原始顺序，越小越可信（torso 比 root 可信）
+    """
+    name = col.name or ""
+    variant = _coll_variant(name)
+    base = _COLL_VARIANT_RE.sub(" ", name).lower()
+    part, conf, rank = None, '', 999
+    if not _ACCESSORY_RE.search(base):
+        for w, key, rk in _COLL_WORDS:
+            if _word_in_base(w, base):
+                part, conf, rank = key, 'name', rk
+                break
+    side = _coll_side(name)
+    if part is None and len(col.bones) and box is not None:
+        part, gside = _coll_geo_part(rig, col, box)
+        if part:
+            conf = 'geo'
+            side = side or gside
+    return part, variant, side, conf, rank
+
+
+_AUTO_CACHE = {}
+
+
+def _mixed_side_members(rig, col):
+    """集合里的骨骼按名字分左右，返回 (左手名单, 右手名单)；分不开返回 None。
+
+    只认名字**结尾**的侧别（`.L` / `_L` / `.l` / 左 / Left）—— 中间的 "_l"
+    会把 `c_leg_pole.r` 这类名字算成左侧。
+    """
+    if col is None or not len(col.bones):
+        return None
+    lft, rgt = [], []
+    for b in col.bones:
+        if _COLL_SIDE_L.search(b.name):
+            lft.append(b.name)
+        elif _COLL_SIDE_R.search(b.name):
+            rgt.append(b.name)
+    if not lft or not rgt:
+        return None
+    return lft, rgt
+
+
+def _split_collection_by_side(rig, col):
+    """把左右混在一起的集合（Rigify 的 `Fingers`）拆成 `Fingers.L` / `Fingers.R`。
+
+    原集合一根骨骼都不动 —— 只是**另建**两个集合，把同一批骨骼按侧别再挂一遍，
+    所以绑定的结构、权重、约束全不受影响，只是多了两条能单独导航的入口。
+    重复调用是幂等的：已经拆过就直接复用，不会增生 `.L.001`。
+    """
+    got = _mixed_side_members(rig, col)
+    if got is None:
+        return None
+    out = []
+    for tag, members in ((".L", got[0]), (".R", got[1])):
+        name = col.name + tag
+        target = _coll_get(rig, name)
+        try:
+            if target is None:
+                target = _arm_of(rig).collections.new(name)
+        except Exception:
+            return None
+        have = set(b.name for b in target.bones)
+        for n in members:
+            if n in have:
+                continue
+            pb = rig.pose.bones.get(n)
+            if pb is None:
+                continue
+            try:
+                target.assign(pb)
+            except Exception:
+                pass
+        out.append(target)
+    return out
+
+
+def auto_layout(rig, use_cache=True, allow_create=True):
+    """读原生集合，自动排三层饼。
+
+    返回 (slots, report)：
+      slots  = {1: [[组], ...8], 2: [...], 3: [...]}   一格可以挂多个集合
+      report = {'total','placed','layers','skip','overflow','unsure'}
+
+    分层规则（用户定的）：
+      · 主饼    —— 身体部件，同一部位的 IK/FK 合成一格；
+      · 细节饼  —— 头发 / 马尾 / 衣服 / 装备 / 武器，以及 (Detail) 变体；
+      · 附属饼  —— (Tweak)/(Extra)/(Parent) 这类修形专用骨。
+
+    **只有名字认出来的才进主饼**，靠几何猜的进细节饼 —— 实测 `马尾`
+    质心在躯干高度，几何会把它塞进「躯干」格，那就错了。
+    """
+    slots = {1: [[] for _ in range(8)],
+             2: [[] for _ in range(8)],
+             3: [[] for _ in range(8)]}
+    report = {'total': 0, 'placed': 0,
+              'layers': {1: 0, 2: 0, 3: 0},
+              'skip': [], 'overflow': [], 'unsure': [], 'split': []}
+    if rig is None or getattr(rig, 'type', None) != 'ARMATURE':
+        return slots, report
+
+    # 面板 draw 里每帧都会问到布局，而整根骨架 795 根骨头的包围盒 +
+    # 约束目标扫描不便宜。按「骨骼数 + 集合数」做键缓存；操作符里
+    # （真正要落盘时）传 use_cache=False 强制重算。
+    ckey = None
+    if use_cache:
+        try:
+            ckey = (rig.name, len(rig.data.bones), len(_colls(rig)))
+            hit = _AUTO_CACHE.get(ckey)
+            if hit is not None:
+                return hit
+        except Exception:
+            ckey = None
+
+    box = _rig_bounds(rig)
+    targets = _constraint_targets(rig)
+    # 只有带 widget 的 rig 才用「有没有形状」判集合性质
+    widget_ok = _widget_coverage(rig) >= 0.05
+    order = {}
+    for i, c in enumerate(_colls(rig)):
+        order[c.name] = i
+
+    body, other = [], []
+    for col in _colls(rig):
+        report['total'] += 1
+        if _coll_is_internal(rig, col, targets):
+            if not _is_divider_collection(col.name):
+                report['skip'].append(col.name)
+            continue
+        part, variant, side, conf, rank = classify_collection(
+            rig, col, box, targets)
+        # 名字认不出部位、且集合里基本全是变形骨（没有可点的控件）→ 排除。
+        # Dialyn-琉音 暴露的：Clothes(65 根 0 形状)、Cage(18 根 0 形状)、
+        # Correctives(19 根 0 形状)、Misc(120 根只有 6 根有形状) —— 这些
+        # 上了饼也点不出东西。反面例子是 Hair(103 根 102 根有形状），那是
+        # 能摆的，必须留。
+        # 判据挂在「依据」上，不能挂 part is None —— 几何兜底会给
+        # Clothes / Cage / Misc 也填上一个部位（质心在躯干高度），
+        # 那样 part 就不是 None 了，判据被绕过，变形骨照样上饼。
+        if conf == 'geo' and widget_ok and _shaped_ratio(rig, col) < 0.30:
+            report['skip'].append(col.name)
+            continue
+        if conf == 'geo':
+            report['unsure'].append(col.name)
+        if variant == 'BODY':
+            layer = 1 if (part and conf == 'name') else 2
+        elif variant == 'DETAIL':
+            layer = 2
+        else:
+            layer = 3
+        # 脸部表情那一整套（Facerig / 表情 / facial）不进主饼：它是「点开才有用」
+        # 的表情骨，占到主饼的头格就把真正的头部控制器挤没了。
+        if _SECONDARY_ONLY_RE.search(col.name or ""):
+            layer = 2
+        base = _COLL_VARIANT_RE.sub(" ", col.name or "").strip()
+        # 手指类原集合常常左右混在一起（Rigify 的 `Fingers`）：拆成
+        # `Fingers.L` / `Fingers.R` 两个真集合，左进左手指格、右进右手指格。
+        # 不拆的话整个集合只能塞进两格里，两边点进去都是同一锅骨骼。
+        # allow_create=False（面板 draw 里那条只读路径）不建集合 ——
+        # draw 里新建 datablock 是要出事的，那条路退回「两边共用一格」。
+        if allow_create and part == 'HAND' and not side and layer in (1, 2):
+            pair = _split_collection_by_side(rig, col)
+            if pair:
+                report['split'].append(col.name)
+                for tag, sub in zip((".L", ".R"), pair):
+                    report['split'].append(sub.name)
+                    if layer == 2:
+                        pref = 7 if tag == ".L" else 1
+                        if not slots[2][pref]:
+                            slots[2][pref] = [sub.name]
+                            continue
+                        other.append((order.get(col.name, 999), sub.name, 2))
+                    else:
+                        body.append((order.get(col.name, 999), sub.name,
+                                     part, tag[1], rank, len(base)))
+                continue
+        rec = (order.get(col.name, 999), col.name, part, side, rank, len(base))
+        if layer == 1:
+            body.append(rec)
+        else:
+            other.append((order.get(col.name, 999), col.name, layer))
+
+    # ---- 主饼：同一个 (部位, 侧别) 只留「最可信」的那批，其余下沉细节饼 ----
+    # 否则 `躯干` 和 `躯干叠加骨骼` 会挤进同一格，点一下选中两套骨骼。
+    grouped = {}
+    pending = {}
+    for _o, name, part, side, rank, blen in sorted(body):
+        grouped.setdefault((part, side), []).append((rank, blen, name))
+    for (part, side), items in sorted(grouped.items()):
+        # 整组都是空集合就别占主饼的位子 —— rig.002 的 `脖子，脑袋` 是 0 根
+        # 骨骼的空集合，靠名字抢到了「头」那一格，点进去什么都没有。
+        if not any(len(_coll_get(rig, n).bones) for _r, _l, n in items
+                   if _coll_get(rig, n) is not None):
+            for _r, _l, name in items:
+                other.append((order.get(name, 999), name, 2))
+            continue
+        # 同部位只留「最可信 + 名字最短」的那批。`躯干` / `躯干控制` /
+        # `躯干叠加骨骼` 三个都命中「躯干」，rank 相同，靠名字长度分主次 ——
+        # 否则点一格会同时选中三套骨骼。而 `Arm.L (IK)` 和 `Arm.L (FK)`
+        # 剥掉变体后都是 `Arm.L`，长度一致，会被当成同一套的同格兄弟。
+        items.sort(key=lambda it: (it[0], it[1], it[2]))
+        best_rank, best_len = items[0][0], items[0][1]
+        slot = _PART_SLOT.get((part, side))
+        if slot is None:
+            slot = _PART_SLOT.get((part, ''))
+        if slot is None:
+            for _r, _l, name in items:
+                other.append((order.get(name, 999), name, 2))
+            continue
+        # v5.2.23：先记到 pending，等全部组都算完再落位 —— 不同
+        # (部位, 侧别) 组映射到同一格时不再无脑叠加。
+        #   课鲁凯皮肤骨架实测：`Upper Arm`（换装皮肤的整臂控制器）靠
+        #   (ARM,'') 和 Arm.R (FK)/(IK) 的 (ARM,'R') 一起落进右臂格，
+        #   `Toes (Cerulean Breaker)` 同理挤进右腿格 —— 点一格选中三套。
+        #   仲裁：带 IK/FK 变体标记的那组胜（一套配对的真控制器才带），
+        #   都不带时取名字最短那组；输家整组下沉细节饼。
+        kept = [n for r, l, n in items if r == best_rank and l == best_len]
+        rest = [n for r, l, n in items if not (r == best_rank and l == best_len)]
+        hasv = any(_name_has_ikfk(n) for n in kept)
+        min_len = min(l for r, l, n in items if r == best_rank and l == best_len)
+        pending.setdefault(slot, []).append(
+            (0 if hasv else 1, min_len, part, side, kept, rest))
+    for slot, cands in pending.items():
+        cands.sort(key=lambda c: (c[0], c[1], c[3]))
+        for _sc, _ml, _p, _s, kept, rest in cands[1:]:
+            for n in kept + rest:
+                other.append((order.get(n, 999), n, 2))
+        _sc, _ml, part, side, kept, rest = cands[0]
+        for name in rest:
+            other.append((order.get(name, 999), name, 2))
+        for name in kept:
+            slots[1][slot].append(name)
+            # Rigify 的 `Fingers` 是双手共用一个集合，没有侧别。只放
+            # 右手位的话饼的左边空一格，用户往左推会落空 —— 同时占
+            # 左右两个位，两边都能点进去，反正指的是同一组骨骼。
+            if part == 'HAND' and not side:
+                slots[1][7 if slot == 1 else 1].append(name)
+
+    # ---- 细节饼 / 附属饼：一格一个，满了往下一层溢 ----
+    # 细节饼里「剥掉变体后同名」的合并成一格：`Tail (IK)` + `Tail (FK)`
+    # 在面板里是两个集合，在饼上该是一个「尾巴」。
+    merged = {}
+    queue = []
+    for o, name, layer in sorted(other):
+        base = _COLL_VARIANT_RE.sub(" ", name or "").strip()
+        if layer == 2 and base and base != name.strip():
+            merged.setdefault(base, []).append((o, name))
+        else:
+            queue.append((o, [name], layer))
+    for base, items in merged.items():
+        queue.append((items[0][0], [n for _o, n in items], 2))
+    queue.sort(key=lambda q: q[0])
+
+    for _o, names, layer in queue:
+        chain = (2, 3) if layer == 2 else (3,)
+        placed = False
+        for lay in chain:
+            for i in range(8):
+                if not slots[lay][i]:
+                    slots[lay][i] = list(names)
+                    placed = True
+                    break
+            if placed:
+                break
+            # 这一层满了也别丢：从后往前找「只挂 1 个」的格子追加，
+            # 一格最多 2 个。点进去会一起选中，但总比找不到强；
+            # 报告里会列出来，面板里点一下就能换回去。
+            for i in range(7, -1, -1):
+                if len(slots[lay][i]) < 2:
+                    slots[lay][i].extend(names)
+                    placed = True
+                    break
+            if placed:
+                break
+        if not placed:
+            report['overflow'].extend(names)
+
+    seen = set()
+    for lay in (1, 2, 3):
+        report['layers'][lay] = sum(1 for g in slots[lay] if g)
+        for g in slots[lay]:
+            seen.update(g)
+    report['placed'] = len(seen)
+    if ckey is not None:
+        if len(_AUTO_CACHE) > 8:
+            _AUTO_CACHE.clear()
+        _AUTO_CACHE[ckey] = (slots, report)
+    return slots, report
+
+
+def _split_group(raw):
+    """槽位值 → 集合名列表。一格可以挂多个，用 | 分隔。"""
+    return [n for n in (raw or "").split("|") if n.strip()]
+
+
+def pie_slot_groups(rig, layer=1):
+    """某一层每格的**完整集合组**（v5.1：一格可以挂多个集合）。
+
+    这是只读函数，跟 pie_slots 一样不许在 draw 里落盘。
+    """
+    groups = [[] for _ in range(8)]
+    if rig is None or getattr(rig, 'type', None) != 'ARMATURE':
+        return groups
+    if not pie_is_initialized(rig, layer):
+        if not pref('pie_auto_fill', True):
+            return groups
+        try:
+            auto, _rep = auto_layout(rig, allow_create=False)
+            return auto.get(layer, groups)
+        except Exception:
+            # 老逻辑兜底：一格一个集合
+            return [[n] if n else [] for n in pie_default_slots(rig, layer)]
+    for i, k in enumerate(pie_slot_keys(layer)):
+        groups[i] = [n for n in _split_group(rig.data.get(k, ""))
+                     if _coll_get(rig, n) is not None]
+    return groups
+
+
+def set_pie_slot_group(rig, layer, slot, names):
+    """写一格（多个集合用 | 连接）。只能是操作符里调，draw 里写会被拒。"""
+    if rig is None or not (0 <= slot < 8) or layer not in (1, 2, 3):
+        return False
+    key = pie_slot_keys(layer)[slot]
+    val = "|".join([n for n in (names or []) if n])
+    rig.data[key] = val
+    return True
 
 
 def pie_all_default_slots(rig):
@@ -2433,7 +3615,7 @@ def pie_all_default_slots(rig):
             used.add(hit.name)
 
     rest = [n for n in preset_names()
-            if n not in used and rig.data.collections.get(n) is not None]
+            if n not in used and _coll_get(rig, n) is not None]
     for i in range(8):
         if slots1[i] or not rest:
             continue
@@ -2483,38 +3665,28 @@ def pie_default_slots(rig, layer=1):
 
 
 def pie_slots(rig, layer=1):
-    """某一层的 8 个饼菜单槽位（空位是空串）。
+    """某一层的 8 个饼菜单槽位（空位是空串）—— **每格取组里第一个名字**。
 
-    **这是只读函数。** 面板和饼菜单都在 draw() 里调它，而 draw 上下文是
-    只读的：在里面写 rig.data[...] 会抛
-    ``AttributeError: Writing to ID classes in this context is not allowed``，
-    而且异常会把整个面板/整张饼截断（现象就是饼只弹出一项、面板那 8 行空白）。
-    所以这里绝不落盘：没初始化就现场算一份默认布局返回，写入只发生在
+    v5.1 起一格可以挂多个集合（`Arm.L (IK)` + `Arm.L (FK)` 同属「左臂」），
+    完整组用 pie_slot_groups 取。这里保留「每格一个名字」的老签名，是因为
+    既有的大量绘制 / 导航 / 测试代码都按名字用，没必要全改一遍。
+
+    **只读。** 面板和饼菜单都在 draw() 里调它，draw 上下文里写
+    rig.data[...] 会抛 AttributeError 并把整块 UI 截断，所以写入只发生在
     操作符里（freeze_pie_slots / init_pie_slots / set_pie_slot）。
     """
-    slots = [""] * 8
-    if rig is None or getattr(rig, "type", None) != 'ARMATURE':
-        return slots
-    if not pie_is_initialized(rig, layer):
-        if not pref('pie_auto_fill', True):
-            return slots
-        return pie_default_slots(rig, layer)
-    for i, k in enumerate(pie_slot_keys(layer)):
-        n = rig.data.get(k, "") or ""
-        if n and rig.data.collections.get(n) is not None:
-            slots[i] = n
-    return slots
+    return [(g[0] if g else "") for g in pie_slot_groups(rig, layer)]
 
 
 def freeze_pie_slots(rig, layer=1):
     """把某一层「当前看到的布局」固化进骨架数据。只能在操作符/非 draw 上下文调用。"""
     if rig is None or getattr(rig, "type", None) != 'ARMATURE':
         return [""] * 8
-    slots = pie_slots(rig, layer)
-    for i, n in enumerate(slots):
-        rig.data[pie_slot_keys(layer)[i]] = n
+    groups = pie_slot_groups(rig, layer)
+    for i, g in enumerate(groups):
+        rig.data[pie_slot_keys(layer)[i]] = "|".join(g)
     rig.data[pie_init_key(layer)] = 1
-    return slots
+    return [("|".join(g) if g else "") for g in groups]
 
 
 def init_pie_slots(rig, layer=1):
@@ -2523,11 +3695,14 @@ def init_pie_slots(rig, layer=1):
         return [""] * 8
     for k in pie_slot_keys(layer):
         rig.data[k] = ""
-    slots = pie_default_slots(rig, layer)
-    for i, n in enumerate(slots):
-        rig.data[pie_slot_keys(layer)[i]] = n
+    # v5.1：不再走老的「方位语义 + 偏好预设补位」，直接吃 auto_layout 的
+    # 归类结果 —— 「重新自动填充」和「一键配置」从此是同一份答案。
+    slots, _rep = auto_layout(rig, use_cache=False)
+    groups = slots.get(layer, [[] for _ in range(8)])
+    for i in range(8):
+        set_pie_slot_group(rig, layer, i, groups[i])
     rig.data[pie_init_key(layer)] = 1
-    return slots
+    return [("|".join(g) if g else "") for g in groups]
 
 
 def set_pie_slot(rig, index, name, layer=1):
@@ -2546,7 +3721,7 @@ def pie_current_collection(rig):
     if rig is None:
         return ""
     name = rig.data.get("cn_collection", "")
-    if name and rig.data.collections.get(name) is not None:
+    if name and _coll_get(rig, name) is not None:
         return name
     active = rig.data.bones.active
     if active is not None:
@@ -2564,7 +3739,7 @@ def enter_pie_collection(context, rig, col_name, pie_layer=0):
     "我现在在骨架的哪个位置"。之后交给 goto_collection，让它把「显示集合、
     选中第一根、记住循环下标、鼠标跟随」这些既有逻辑统一走一遍。
     """
-    col = rig.data.collections.get(col_name)
+    col = _coll_get(rig, col_name)
     if col is None:
         return False, "骨架里没有集合「%s」" % col_name
 
@@ -2580,7 +3755,7 @@ def enter_pie_collection(context, rig, col_name, pie_layer=0):
         pb.select = False
     first = default_first_bone(rig, col_name)
     if first not in names:
-        first = names[0]
+        first = smart_first_bone(rig, names)
     for n in names:
         select_bone(rig, n, extend=True)
 
@@ -2619,12 +3794,50 @@ def collection_nav_names(rig, col, mode="", cur=""):
     return nav or names
 
 
-def filter_nav_names(rig, names, mode="", cur_name=""):
+
+def filter_nav_names(rig, names, mode="", cur_name="", keep_all=False):
     """导航过滤：可见性优先，再按每根骨骼自己的 IK/FK 模式收敛。
 
     ARP 的四肢可以各自 IK/FK；不能用一个全局 mode 过滤整张列表。
     通用控制器（无 ik/fk 标记）始终保留。
+
+    v5.2.9 兜底：过滤后**剩不到 2 根**、而原始列表有 2 根以上时，退回
+    原始列表。实测 bug（RIG - Anby_SoldierZero）：FK_Arm.L 三根 FK 里两根
+    被 H 隐藏（rig 脚本在 IK 态藏 FK），过滤后只剩 FK_Hand.L 一根 ——
+    集合顺序排得再好滚轮也永远切不动。
+
+    v5.2.11：**集合导航一律 keep_all**。实测 v5.2.9 的「剩<2 才兜底」
+    卡不住剩 2 根的场景：FK_Arm.L 三根里大臂被 H，滚轮永远在
+    前臂↔手之间打转，大臂怎么都轮不到（用户的原话：明明归类在这个
+    集合里却切不到）。集合是用户一根根归进去的，成员就该完整轮，
+    隐藏骨由 select_bone 顺手显示兜住；可见性过滤只留给全局列表。
     """
+    if keep_all:
+        full = [n for n in names if _pb_get(rig, n) is not None]
+        # v5.2.15：keep_all 也要跳过「当前模式另一套」的控制器 —— ARP 骨架
+        # FK 态滚轮会切到看不见的 c_hand_ik.r（集合里 IK/FK 混排，模式标记
+        # 按名字认，跟可见性无关）。Anby 那种「被 H 的 FK 骨」不受影响：
+        # 它们有 FK 标记、当前模式也是 FK，照样完整轮；只有和当前模式
+        # 相反的那套被跳过。当前骨被滤掉或一根不剩 → 退回全表（不重演
+        # v5.2.9 的「轮不动」卡死）。
+        if pref('same_mode', True):
+            m = mode or (bone_mode(cur_name) if cur_name else "") \
+                or (bone_mode_inherited(rig, cur_name) if cur_name else "")
+            if m:
+                kept = []
+                for n in full:
+                    tag = bone_mode(n) or bone_mode_inherited(rig, n)
+                    if not tag:
+                        kept.append(n)
+                        continue
+                    own = _bone_own_mode(rig, n, m)
+                    if own and tag != own:
+                        continue
+                    kept.append(n)
+                if kept and (not cur_name or cur_name in kept):
+                    return kept
+        return full
+
     out = []
     for n in names:
         pb = rig.pose.bones.get(n)
@@ -2647,6 +3860,12 @@ def filter_nav_names(rig, names, mode="", cur_name=""):
             kept.append(n)
         if kept:
             out = kept
+
+    full = [n for n in names if rig.pose.bones.get(n) is not None]
+    if cur_name and cur_name in full and cur_name not in out:
+        return full
+    if len(out) < 2 and len(full) >= 2:
+        return full
     return out
 
 
@@ -2656,13 +3875,15 @@ def nav_list(rig, cur_name):
     匹配空间排序关键字的集合：按 (head_z, tail_z) 从高到低。
     其余集合：完全按你 assign 进集合的顺序。
     """
-    bone = rig.data.bones.get(cur_name) if cur_name else None
+    _error_wash()
+    bone = _bone_get(rig, cur_name) if cur_name else None
 
     if bone is not None:
         col = nav_collection(rig, bone)
         if col is not None:
             mode = effective_mode(rig, cur_name, col.name)
-            return filter_nav_names(rig, collection_bone_names(rig, col), mode, cur_name)
+            return filter_nav_names(rig, collection_bone_names(rig, col), mode,
+                                    cur_name, keep_all=True)
     mode = effective_mode(rig, cur_name, "")
     return filter_nav_names(rig, [pb.name for pb in rig.pose.bones], mode, cur_name)
 
@@ -2677,13 +3898,17 @@ def nav_neighbor_name(rig, cur_name, step):
     属于「前发」和「Hair」的骨骼时，next 一步会按"最小集合"重算范围，
     13 根就变成一会儿 5 根、一会儿 8 根，永远轮不完。
     """
-    bone = rig.data.bones.get(cur_name) if cur_name else None
+    _error_wash()
+    bone = _bone_get(rig, cur_name) if cur_name else None
     col = nav_collection(rig, bone) if bone is not None else None
     if col is not None:
         remember_scope(rig, col.name)
+        _error_wash()
         mode = effective_mode(rig, cur_name, col.name)
-        names = filter_nav_names(rig, collection_bone_names(rig, col), mode, cur_name)
+        names = filter_nav_names(rig, collection_bone_names(rig, col), mode,
+                                 cur_name, keep_all=True)
     else:
+        _error_wash()
         names = nav_list(rig, cur_name)
     if not names:
         return ""
@@ -2763,7 +3988,7 @@ def ensure_preset_name(name):
 
 def ensure_collection(arm, name):
     """拿到集合，没有就新建。返回 (collection, 是否新建)。"""
-    col = arm.collections.get(name)
+    col = _coll_get(arm, name)
     if col is not None:
         return col, False
     return arm.collections.new(name), True
@@ -2779,7 +4004,7 @@ def importable_collections(rig):
     out = []
     if rig is None:
         return out
-    for c in rig.data.collections:
+    for c in _colls(rig):
         if len(c.bones) == 0:
             continue
         if _INTERNAL_COLL_RE.match(c.name):
@@ -2800,7 +4025,7 @@ def cycle_names(rig, only_non_empty=False):
     if rig is None:
         return out
     for n in preset_names():
-        col = rig.data.collections.get(n)
+        col = _coll_get(rig, n)
         if col is None:
             continue
         if only_non_empty and len(col.bones) == 0:
@@ -2819,7 +4044,7 @@ def cycle_order(rig):
     if rig is None:
         return out
     for n in preset_names():
-        if rig.data.collections.get(n) is not None:
+        if _coll_get(rig, n) is not None:
             out.append(n)
     return out
 
@@ -2849,7 +4074,7 @@ def current_cycle_name(rig, bone=None):
     if name:
         return name
     forced = rig.data.get("cn_collection")
-    if forced and rig.data.collections.get(forced):
+    if forced and _coll_get(rig, forced):
         return forced
     return None
 
@@ -2862,6 +4087,54 @@ def _is_descendant(col, ancestor):
             return True
         c = c.parent
     return False
+
+
+_VIS_SNAPSHOT_KEY = "cn_vis_snapshot"
+
+
+def save_visibility_snapshot(rig, force=False):
+    """记下所有集合的「看得见 / 单独显示」状态。
+
+    只在第一次进饼时存（force=True 可以覆盖），因为饼间互斥会不停改
+    is_visible，跟着更新的话快照就跟着脏了，还原等于没还原。
+    """
+    if rig is None or getattr(rig, 'type', None) != 'ARMATURE':
+        return False
+    if not force and rig.data.get(_VIS_SNAPSHOT_KEY):
+        return False
+    try:
+        data = {}
+        for c in _colls(rig):
+            data[c.name] = [bool(c.is_visible), bool(c.is_solo)]
+        rig.data[_VIS_SNAPSHOT_KEY] = json.dumps(data, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def restore_visibility(rig):
+    """按快照还原集合可见性。返回还原了几个；没有快照返回 -1。"""
+    if rig is None or getattr(rig, 'type', None) != 'ARMATURE':
+        return -1
+    raw = rig.data.get(_VIS_SNAPSHOT_KEY, "")
+    if not raw:
+        return -1
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return -1
+    n = 0
+    for c in _colls(rig):
+        st = data.get(c.name)
+        if st is None:
+            continue
+        try:
+            c.is_visible = bool(st[0])
+            c.is_solo = bool(st[1])
+            n += 1
+        except Exception:
+            pass
+    return n
 
 
 def hide_collection_tree(col):
@@ -2877,13 +4150,19 @@ def hide_collection_tree(col):
 
 
 def _pie_managed_names(rig):
-    """三个饼层槽位里出现过的集合（并集）—— 就是「饼菜单管得着的那批」。"""
+    """三个饼层槽位里出现过的集合（并集）—— 就是「饼菜单管得着的那批」。
+
+    v5.1：必须走 pie_slot_groups 展开整组。一格挂多个集合时
+    （`手指` 格 = 手指 + 右手指 + 左手指），只取每格第一个的话，
+    组里的其余集合会被当成「别的饼的」而藏掉 —— 明明就在当前这张饼上。
+    """
     out = set()
     for layer in (1, 2, 3):
         try:
-            for n in pie_slots(rig, layer):
-                if n and rig.data.collections.get(n) is not None:
-                    out.add(n)
+            for g in pie_slot_groups(rig, layer):
+                for n in g:
+                    if n and _coll_get(rig, n) is not None:
+                        out.add(n)
         except Exception:
             pass
     return out
@@ -2909,15 +4188,21 @@ def isolate_previous_collection(rig, keep_name, pie_layer=0):
         return
     if not pie_layer:
         return
-    cur = set(n for n in pie_slots(rig, pie_layer)
-              if n and rig.data.collections.get(n) is not None)
+    # 第一次进饼先拍一张原始显示状态，之后随时能一键还原
+    save_visibility_snapshot(rig)
+    # 同样是整组展开，不是每格第一个
+    cur = set()
+    for g in pie_slot_groups(rig, pie_layer):
+        for n in g:
+            if n and _coll_get(rig, n) is not None:
+                cur.add(n)
     if not cur:
         return
-    keep = rig.data.collections.get(keep_name)
+    keep = _coll_get(rig, keep_name)
     for n in _pie_managed_names(rig) - cur:
         if n == keep_name:
             continue
-        col = rig.data.collections.get(n)
+        col = _coll_get(rig, n)
         if col is None or col is keep:
             continue
         # 要进的集合是它的子代就别藏父级，否则刚显示又被自己藏掉
@@ -2926,7 +4211,7 @@ def isolate_previous_collection(rig, keep_name, pie_layer=0):
         hide_collection_tree(col)
     # 当前这张饼的全部槽位集合亮出来
     for n in sorted(cur):
-        show_collection(rig.data.collections.get(n))
+        show_collection(_coll_get(rig, n))
     rig.data["cn_last_pie_layer"] = pie_layer
 
 
@@ -2947,7 +4232,7 @@ def show_collection(col):
             pass
     if not col_visible(col):
         try:
-            for c in col.id_data.collections:
+            for c in _colls(col.id_data):
                 c.is_solo = False
         except Exception:
             pass
@@ -2968,6 +4253,76 @@ def default_first_bone(rig, col_name):
         return ""
 
 
+# 名字里带这些的，永远不配当「第一根」：许可证水印、属性开关、机制骨
+# `parent` 这一类是 Rigify 系的 IK/FK 属性开关骨（`thigh_parent.L` /
+# `Hip_parent_L` / `Shoulder_parent_L`），它们自带 widget 形状、名字也干净，
+# 光靠 widget 打分会被选成第一根 —— 用户报的「大腿根部那个属性骨」。
+_FIRST_BAD_RE = re.compile(
+    r"(license|licence|copyright|watermark|水印|属性|(^|[-_. ])jd([-_. ]|$)"
+    r"|(^|[-_. ])parent([-_. ]|$)|(^|[-_. ])prop([-_. ]|$)"
+    r"|^mch|[-_. ]mch([-_. ]|$)|^org[-_.]"
+    r"|^def[-_.]|deform)", re.I)
+# 名字里带这些的，是给人转的控制骨，优先
+_FIRST_GOOD_RE = re.compile(r"(master|ctrl|control|grip|_fk|_ik|[.]fk|[.]ik)", re.I)
+
+
+def smart_first_bone(rig, names):
+    """没手动指定「默认骨骼」时，挑真正有动画用途的那根当第一根。
+
+    v5.1 及以前直接取 names[0] —— 但集合里的第一根往往不是能转的控制器：
+    Rigify 系每个肢体都把 `Hip_parent_L` / `thigh_parent.L` 排在腿格最前，
+    而 IK/FK 开关就长在它身上。点进「左腿」先选中它，方向键一转是在翻属性，
+    脚一点不动 —— 用户报的「第一个控件应该是脚底 IK 而不是大腿根属性骨」。
+
+    判定顺序：
+      1. 集合里有 IK/FK 肢体命中 → 按当前模式落**末端控制器**
+         （IK 态落 Ankle_ik / foot_ik，FK 态落 Ankle_fk / foot_fk）；
+      2. 否则打分：有 widget 形状、名字带 master/ctrl 的优先，
+         许可证 / 属性 / MCH / ORG / DEF 一律垫底。
+    """
+    if rig is None or not names:
+        return ""
+    pool = [n for n in names if rig.pose.bones.get(n) is not None]
+    if not pool:
+        return names[0]
+    try:
+        _kind, limbs = ikfk_limbs(rig)
+    except Exception:
+        limbs = []
+    if limbs:
+        pset = set(pool)
+        for lb in limbs:
+            ik_hit = [n for n in lb.ik_controls if n in pset]
+            fk_hit = [n for n in lb.fk_controls if n in pset]
+            if not (ik_hit or fk_hit):
+                continue
+            mode = limb_mode(rig, lb) or "IK"
+            # 先按当前模式那一侧挑；这一侧一根都没在这个集合里（比如 FK 骨
+            # 被单独收进别的集合），退到另一侧，总比落回属性骨强
+            pick = _primary_control(ik_hit if mode == "IK" else fk_hit)
+            if not pick:
+                pick = _primary_control(fk_hit if mode == "IK" else ik_hit)
+            if pick:
+                return pick
+    best, best_score = pool[0], None
+    for n in pool:
+        pb = rig.pose.bones.get(n)
+        score = 0
+        if _FIRST_BAD_RE.search(n):
+            score -= 100
+        if _FIRST_GOOD_RE.search(n):
+            score += 3
+        try:
+            if pb is not None and pb.custom_shape is not None:
+                score += 4
+        except Exception:
+            pass
+        if best_score is None or score > best_score:
+            best, best_score = n, score
+    return best
+
+
+
 def goto_collection(context, rig, name, pie_layer=0):
     """切到指定集合：显示它、选中第一根骨骼、把它设为导航集合。
 
@@ -2978,7 +4333,7 @@ def goto_collection(context, rig, name, pie_layer=0):
     pie_layer：从哪一张饼进来的（1/2/3），0 = 滚轮或侧栏面板这条路。
     饼菜单要靠它把「上一张饼的集合」整套收掉，见 isolate_previous_collection。
     """
-    col = rig.data.collections.get(name)
+    col = _coll_get(rig, name)
     if col is None:
         return False, "骨架里没有集合「%s」" % name
     # 无论从哪条路进集合（饼菜单/滚轮循环/面板）都记下出发视角，BackSpace
@@ -2996,7 +4351,7 @@ def goto_collection(context, rig, name, pie_layer=0):
     isolate_previous_collection(rig, name, pie_layer)
     first = default_first_bone(rig, name)
     if first not in bones:
-        first = bones[0]
+        first = smart_first_bone(rig, bones)
     select_bone(rig, first, extend=False)
     remember_mode(rig, first)
     rig.data["cn_collection"] = name
@@ -3032,7 +4387,7 @@ def step_collection(context, rig, delta):
     # 空集合跳过，但下标仍按完整清单推进，顺序不会被打乱
     for k in range(1, len(names) + 1):
         ni = (idx + delta * k) % len(names)
-        col = rig.data.collections.get(names[ni])
+        col = _coll_get(rig, names[ni])
         if col is not None and len(col.bones) > 0:
             return goto_collection(context, rig, names[ni])
     return False, "循环清单里的集合都是空的，先往里放控制器"
@@ -3063,7 +4418,7 @@ def rig_collection_rows(rig):
         return []
     presets = set(preset_names())
     rows = []
-    for col in rig.data.collections:
+    for col in _colls(rig):
         if col.name in presets:
             continue
         if _INTERNAL_COLL_RE.match(col.name):
@@ -3079,7 +4434,7 @@ def preset_menu_rows(rig):
     """(集合名, 菜单文字, 图标) —— 纯数据，方便脱离 UI 测试。"""
     rows = []
     for name in preset_names():
-        col = rig.data.collections.get(name) if rig else None
+        col = _coll_get(rig, name) if rig else None
         if col is None:
             rows.append((name, "%s   ＋新建" % name, 'ADD'))
         else:
@@ -3266,13 +4621,13 @@ class POSE_OT_cn_remove_from_collection_v45(bpy.types.Operator):
             return {'CANCELLED'}
 
         if self.all_collections:
-            targets = list(rig.data.collections)
+            targets = list(_colls(rig))
             label = "所有集合"
         else:
             name = (self.collection or "").strip()
             if not name:
                 name = current_cycle_name(rig, rig.data.bones.active) or ""
-            col = rig.data.collections.get(name) if name else None
+            col = _coll_get(rig, name) if name else None
             if col is None:
                 self.report({'WARNING'}, "当前没有可移出的集合")
                 return {'CANCELLED'}
@@ -3323,7 +4678,7 @@ class CN_MT_other_collections_v45(bpy.types.Menu):
         col = layout.column(align=True)
         for name, text, icon in rows:
             row = col.row(align=True)
-            c = rig.data.collections.get(name)
+            c = _coll_get(rig, name)
             empty = c is not None and len(c.bones) == 0
             row.enabled = has_sel or empty
             op = row.operator("pose.cn_assign_preset_v45", text=text, icon=icon)
@@ -3335,18 +4690,33 @@ class CN_MT_other_collections_v45(bpy.types.Menu):
 
 
 def pie_rig(context):
-    """饼菜单绘制时的骨架。context.object 在某些 UI 上下文里是空的，逐层兜底。"""
+    """饼菜单绘制时的骨架。context.object 在某些 UI 上下文里是空的，逐层兜底。
+
+    v5.2.19：一个文件里好几套骨架（元骨 + 成品骨 + 表情骨）时，active 常常
+    不是骨架，原来「从 selected_objects 里挑第一根」会挑到跟用户正在看的
+    无关的那套 —— 弹窗里列的集合就驴唇不对马嘴（Eldreda_Sunbringer 实测）。
+    现在挑到多根时优先取**配置过饼**的那根（data 里有 cn_* 记号）。
+    """
     for attr in ("object", "active_object"):
         ob = getattr(context, attr, None)
         if ob is not None and getattr(ob, "type", None) == 'ARMATURE':
             return ob
+    cands = []
     for ob in (getattr(context, "selected_objects", None) or []):
         if getattr(ob, "type", None) == 'ARMATURE':
-            return ob
-    ob = bpy.context.object
-    if ob is not None and getattr(ob, "type", None) == 'ARMATURE':
-        return ob
-    return None
+            cands.append(ob)
+    if not cands:
+        ob = bpy.context.object
+        if ob is not None and getattr(ob, "type", None) == 'ARMATURE':
+            cands.append(ob)
+    if len(cands) > 1:
+        for ob in cands:
+            try:
+                if any(str(k).startswith("cn_") for k in ob.data.keys()):
+                    return ob
+            except Exception:
+                pass
+    return cands[0] if cands else None
 
 
 def pie_menu_poll(context):
@@ -3405,88 +4775,357 @@ class POSE_OT_cn_pie_jump_v45(bpy.types.Operator):
 
 
 class POSE_OT_cn_pie_assign_v45(bpy.types.Operator):
-    """给饼菜单的某一格指定集合（饼里/面板里点一下都会弹集合列表）"""
+    """给饼菜单的某一格指定集合（小窗：过滤框 + 本骨架集合列表 + 清空）
+
+    v5.2.10：v5.2.9 还是塞了一堆「预设新建 / 内部集合 / 格内顺序 / 整格
+    换位」—— 用户点开这里只有一个目的：把这格换成另一个集合。多余的
+    全删（新建集合在骨骼面板按 M 就行）。另修一个嵌套弹窗 bug：弹窗里
+    点任何一行都会走 invoke() 又开一层新弹窗（叠三层就是它），现在
+    from_popup 的调用直接落 execute，点完即写入并关窗。
+    """
+
     bl_idname = "pose.cn_pie_assign_v45"
     bl_label = "指定饼菜单格子"
     bl_options = {'REGISTER', 'UNDO'}
 
     slot: bpy.props.IntProperty(name="格位", default=0, min=0, max=7)
     layer: bpy.props.IntProperty(name="饼层", default=1, min=1, max=3)
-    collection: bpy.props.StringProperty(name="集合")
+    # v5.2.16：这四个必须 SKIP_SAVE —— 侧栏/饼菜单按钮只设置 slot 和 layer，
+    # 其它属性会继承「本会话上次调用留下的值」：弹窗里点过一次集合后
+    # from_popup=True + collection=那个集合 被记住，之后侧栏每点一格都
+    # 直接走 execute 把同一个集合写进去，弹窗都不开（用户实测：
+    # 点了一下「头部」，之后所有格子全变「头部」）。
+    collection: bpy.props.StringProperty(
+        name="集合", options={'SKIP_SAVE'})
+    # v5.1：一格能挂多个集合（左臂 = Arm.L (IK) + Arm.L (FK)）
+    append: bpy.props.BoolProperty(
+        name="加进这一格", default=False, options={'SKIP_SAVE'})
+    # v5.2.14：从格内摘掉一个集合（保留其余成员），配合「这一格」小节用
+    remove: bpy.props.BoolProperty(
+        default=False, options={'HIDDEN', 'SKIP_SAVE'})
     # 集合名是中文，交给 EnumProperty 当 identifier 会在下拉里显示成乱码
     # （第一项还是空 identifier，更要命），所以这里用 StringProperty + 自绘
     # 弹窗列表，标识符只走整数 slot，绝不拿集合名当 ID。
+    filter: bpy.props.StringProperty(
+        name="过滤", default="",
+        description="输入关键字筛选集合（如 arm / 头 / 武器）",
+    )
+    from_popup: bpy.props.BoolProperty(
+        default=False, options={'HIDDEN', 'SKIP_SAVE'})
+
+    MAX_ROWS = 14
 
     @classmethod
     def poll(cls, context):
         return pie_menu_poll(context)
 
-    def invoke(self, context, event):
-        rig = pie_rig(context)
-        if rig is None:
-            return {'CANCELLED'}
+    def _item(self, lay, nm, text, icon):
+        r = lay.row(align=True)
+        op = r.operator("pose.cn_pie_assign_v45", text=text, icon=icon)
+        op.slot = self.slot
+        op.layer = self.layer
+        op.collection = nm
+        op.from_popup = True
+        # v5.2.21：行尾 ＝ 把集合**追加**进这一格 —— 之前格内能 ✕ 摘除、
+        # 列表行却只能整格替换，用户「不知道怎么把集合加进去」。
+        opa = r.operator("pose.cn_pie_assign_v45", text="", icon='ADD')
+        opa.slot = self.slot
+        opa.layer = self.layer
+        opa.collection = nm
+        opa.append = True
+        opa.from_popup = True
+
+    def _draw_body(self, lay, context):
         idx, layer = self.slot, self.layer
         lname = dict((l, n) for l, n, _k, _i in PIE_LAYERS).get(layer, "")
-        wm = context.window_manager
+        rig = pie_rig(context)
+        lay.label(text="%s · %s（%s）"
+                  % (lname, PIE_DIRS[idx], PIE_DIR_HINTS[idx]),
+                  icon='MESH_CIRCLE')
+        lay.prop(self, "filter", text="", icon='VIEWZOOM')
+        if rig is None:
+            lay.label(text="先选中一根骨架", icon='ERROR')
+            return
 
-        def draw(menu_self, _ctx):
-            lay = menu_self.layout
+        flt = (self.filter or "").strip().lower()
 
-            def item(nm, text, icon):
-                op = lay.operator("pose.cn_pie_assign_v45", text=text, icon=icon)
-                op.slot = idx
-                op.layer = layer          # ★ 不带上它，弹窗里再点会写回主饼
-                op.collection = nm
+        # v5.2.19：文件里不止一套骨架时把本弹窗绑的是谁挑明 —— 元骨/成品骨/
+        # 表情骨混在一个 blend 里，绑错了用户根本看不出来（只会觉得「明明
+        # 有集合怎么弹窗里没东西」）。
+        if rig is not None:
+            try:
+                n_arms = sum(1 for o in bpy.data.objects
+                             if o.type == 'ARMATURE')
+            except Exception:
+                n_arms = 1
+            if n_arms > 1:
+                lay.label(text="骨架：%s" % rig.name, icon='ARMATURE_DATA')
 
-            lay.label(text="%s · %s（%s）"
-                      % (lname, PIE_DIRS[idx], PIE_DIR_HINTS[idx]),
-                      icon='MESH_CIRCLE')
+        # v5.2.14：「这一格」小节 —— 一格挂多个集合时（格名只显示第 1 个
+        # 再缀 +N），这里把整组摊开看清楚：排 1 的是点进去先选中的，
+        # 后面每个带 ✕，点一下只摘这一个、其余不动。
+        try:
+            grp = [n for n in pie_slot_groups(rig, layer)[idx] if n]
+        except Exception:
+            grp = []
+        if grp:
+            lay.separator()
+            head = lay.row()
+            head.label(text="这一格挂了 %d 个集合" % len(grp), icon='BOOKMARKS')
+            for i, nm in enumerate(grp):
+                r2 = lay.row(align=True)
+                col = _coll_get(rig, nm)
+                cnt = len(col.bones) if col else 0
+                icon = 'LAYER_ACTIVE' if i == 0 else 'BLANK1'
+                r2.label(text="%s%s · %d 根" % (
+                    "① " if i == 0 else "%d. " % (i + 1), nm, cnt), icon=icon)
+                opx = r2.operator("pose.cn_pie_assign_v45", text="",
+                                  icon='X')
+                opx.slot = idx
+                opx.layer = layer
+                opx.collection = nm
+                opx.remove = True
+                opx.from_popup = True
             lay.separator()
 
-            # v5.0.4：先列**骨架原生的全部集合**（顺序跟骨骼面板一致），
-            # 再列偏好预设里有、这根骨架还没有的。以前只列「有骨骼的非内部
-            # 集合」，Rigify 的空 FK/Tweak 集合和容器集合都进不了候选。
-            native, internal = assign_collection_rows(rig)
-            if native:
-                lay.label(text="本骨架的集合（%d 个）" % len(native),
-                          icon='OUTLINER_COLLECTION')
-                for nm, text, icon in native:
-                    item(nm, text, icon)
-            else:
-                lay.label(text="这根骨架没有可控集合", icon='ERROR')
+        native, internal = assign_collection_rows(rig)
+        if native:
+            hits = [r for r in native if not flt or flt in r[0].lower()]
+            for nm, text, icon in hits[:self.MAX_ROWS]:
+                self._item(lay, nm, text, icon)
+            if len(hits) > self.MAX_ROWS:
+                lay.label(text="还有 %d 个 —— 输入关键字筛选"
+                          % (len(hits) - self.MAX_ROWS), icon='INFO')
+        else:
+            lay.label(text="这根骨架没有任何骨骼集合", icon='ERROR')
+        # v5.2.20：内部集合（ORG/MCH/DEF）段按用户要求去掉 —— v5.2.19 真正的
+        # 病根是 5.x 的 collections 只剩顶层、子集合全漏，那批「没东西」靠
+        # _colls() 修好了，这个补丁段失去了存在意义，只添堵。
 
-            miss = missing_preset_rows(rig)
-            if miss:
-                lay.separator()
-                lay.label(text="预设里有、这根骨架没有（点了新建）", icon='ADD')
-                for nm, text, icon in miss:
-                    item(nm, text, icon)
-
-            if internal:
-                lay.separator()
-                lay.label(text="内部集合 MCH / DEF / ORG（一般不用）",
-                          icon='COLLECTION_COLOR_01')
-                for nm, text, icon in internal:
-                    item(nm, text, icon)
-
+        # 清空：只有这格真有内容才显示，点了直接写空并关窗
+        if any(pie_slot_groups(rig, layer)[idx]):
             lay.separator()
-            op = lay.operator("pose.cn_pie_assign_v45", text="清空这一格", icon='X')
+            op = lay.operator("pose.cn_pie_assign_v45", text="清空这一格",
+                              icon='X')
             op.slot = idx
             op.layer = layer
             op.collection = ""
+            op.from_popup = True
 
-        wm.popup_menu(draw, title="%s · %s" % (lname or "饼菜单", PIE_DIRS[idx]))
-        return {'RUNNING_MODAL'}
+    def invoke(self, context, event):
+        if self.from_popup:
+            # 弹窗里点行：直接写入并关窗，绝不再 invoke 开新弹窗
+            return self.execute(context)
+        rig = pie_rig(context)
+        if rig is None:
+            return {'CANCELLED'}
+        self.filter = ""
+        wm = context.window_manager
+        try:
+            return wm.invoke_popup(self, width=300)
+        except Exception:
+            # 极老版本没有 invoke_popup：退回菜单，至少功能还在
+            wm.popup_menu(self._draw_menu,
+                          title="%s · %s" % (
+                              dict((l, n) for l, n, _k, _i in PIE_LAYERS
+                                   ).get(self.layer, "饼菜单"),
+                              PIE_DIRS[self.slot]))
+            return {'FINISHED'}
+
+    def draw(self, context):
+        self._draw_body(self.layout, context)
+
+    def _draw_menu(self, menu, context):
+        self._draw_body(menu.layout, context)
 
     def execute(self, context):
         rig = pie_rig(context)
         if rig is None or not edit_ok(rig):
             return {'CANCELLED'}
-        set_pie_slot(rig, self.slot, self.collection, self.layer)
-        self.report({'INFO'}, "%s %s → %s"
-                    % (dict((l, n) for l, n, _k, _i in PIE_LAYERS).get(
-                        self.layer, "饼"),
-                       PIE_DIRS[self.slot], self.collection or "（空）"))
+        if self.remove and self.collection:
+            # 只摘掉这一个成员，其余保留（摘光 = 清空这一格）
+            cur = [n for n in pie_slot_groups(rig, self.layer)[self.slot]
+                   if n and n != self.collection]
+            set_pie_slot(rig, self.slot, "|".join(cur), self.layer)
+            self.report({'INFO'}, "已从格内移除 %s" % self.collection)
+        elif self.append and self.collection:
+            cur = [n for n in pie_slot_groups(rig, self.layer)[self.slot] if n]
+            if self.collection not in cur:
+                cur.append(self.collection)
+            set_pie_slot(rig, self.slot, "|".join(cur), self.layer)
+        else:
+            set_pie_slot(rig, self.slot, self.collection, self.layer)
+        if self.append and self.collection:
+            self.report({'INFO'}, "已把 %s 加进这一格（共 %d 个）"
+                        % (self.collection,
+                           len([n for n in pie_slot_groups(
+                               rig, self.layer)[self.slot] if n])))
+        else:
+            self.report({'INFO'}, "%s %s → %s"
+                        % (dict((l, n) for l, n, _k, _i in PIE_LAYERS).get(
+                            self.layer, "饼"),
+                           PIE_DIRS[self.slot], self.collection or "（空）"))
+        if self.from_popup:
+            # 小窗里点完就关：模拟一次 Esc（插件在 rigui 弹窗上用的同款手法）
+            try:
+                win = context.window
+                win.event_simulate(type='ESC', value='PRESS')
+                win.event_simulate(type='ESC', value='RELEASE')
+            except Exception:
+                pass
+        # v5.2.15：写完立刻重绘侧栏 —— invoke_popup 弹窗不会带着侧栏重绘，
+        # 格子明明写进去了面板还停在（空），看起来像没生效，用户只能反复
+        # 重开弹窗重试（「一直弹这个」的真相）。
+        try:
+            for area in context.window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        except Exception:
+            pass
+        return {'FINISHED'}
+
+
+class POSE_OT_cn_slot_order_v45(bpy.types.Operator):
+    """把一个格子里的集合往前/往后挪 —— 排第一的那个就是「点进去先选中」的"""
+    bl_idname = "pose.cn_slot_order_v45"
+    bl_label = "调整格内顺序"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    slot: bpy.props.IntProperty(default=0, min=0, max=7)
+    layer: bpy.props.IntProperty(default=1, min=1, max=3)
+    collection: bpy.props.StringProperty()
+    delta: bpy.props.IntProperty(default=-1)
+
+    @classmethod
+    def poll(cls, context):
+        return pie_menu_poll(context)
+
+    def execute(self, context):
+        rig = pie_rig(context)
+        if rig is None or not edit_ok(rig):
+            return {'CANCELLED'}
+        grp = list(pie_slot_groups(rig, self.layer)[self.slot])
+        if len(grp) < 2 or self.collection not in grp:
+            return {'CANCELLED'}
+        i = grp.index(self.collection)
+        j = max(0, min(len(grp) - 1, i + self.delta))
+        if i == j:
+            return {'CANCELLED'}
+        grp.insert(j, grp.pop(i))
+        set_pie_slot(rig, self.slot, "|".join(grp), self.layer)
+        self.report({'INFO'}, "%s → 第 %d 位" % (self.collection, j + 1))
+        return {'FINISHED'}
+
+
+class POSE_OT_cn_slot_swap_v45(bpy.types.Operator):
+    """把这一格的集合整体换到另一格（两格内容对调）"""
+    bl_idname = "pose.cn_slot_swap_v45"
+    bl_label = "交换两格"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    layer: bpy.props.IntProperty(default=1, min=1, max=3)
+    slot_a: bpy.props.IntProperty(default=0, min=0, max=7)
+    slot_b: bpy.props.IntProperty(default=1, min=0, max=7)
+
+    @classmethod
+    def poll(cls, context):
+        return pie_menu_poll(context)
+
+    def execute(self, context):
+        rig = pie_rig(context)
+        if rig is None or not edit_ok(rig):
+            return {'CANCELLED'}
+        if self.slot_a == self.slot_b:
+            return {'CANCELLED'}
+        groups = pie_slot_groups(rig, self.layer)
+        ga = list(groups[self.slot_a])
+        gb = list(groups[self.slot_b])
+        set_pie_slot(rig, self.slot_a, "|".join(gb), self.layer)
+        set_pie_slot(rig, self.slot_b, "|".join(ga), self.layer)
+        self.report({'INFO'}, "%s ↔ %s" % (PIE_DIRS[self.slot_a],
+                                           PIE_DIRS[self.slot_b]))
+        return {'FINISHED'}
+
+
+class POSE_OT_cn_auto_layout_v45(bpy.types.Operator):
+    """一键配置：读骨架原生集合，自动归类进三层饼菜单
+
+    跟「重新自动填充」的区别：那个一次只填一层，这个三层一起定，
+    而且会先算一整份归类再落盘，层与层之间不会抢集合。
+    """
+    bl_idname = "pose.cn_auto_layout_v45"
+    bl_label = "一键配置饼菜单"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'POSE'
+                and context.object is not None
+                and context.object.type == 'ARMATURE')
+
+    def execute(self, context):
+        rig = context.object
+        if rig is None or not edit_ok(rig):
+            self.report({'WARNING'}, "这根骨架是只读的（库链接）")
+            return {'CANCELLED'}
+        slots, rep = auto_layout(rig, use_cache=False)
+        if rep['placed'] == 0:
+            self.report({'WARNING'}, "这根骨架里没有认出可用的集合")
+            return {'CANCELLED'}
+        for layer in (1, 2, 3):
+            groups = slots.get(layer, [[] for _ in range(8)])
+            for i in range(8):
+                set_pie_slot_group(rig, layer, i, groups[i])
+            rig.data[pie_init_key(layer)] = 1
+        msg = "配好 %d 个：主饼 %d 格 / 细节 %d 格 / 附属 %d 格" % (
+            rep['placed'], rep['layers'][1], rep['layers'][2], rep['layers'][3])
+        if rep['skip']:
+            msg += " · 排除 %d 个" % len(rep['skip'])
+        if rep['overflow']:
+            msg += " · %d 个没放下" % len(rep['overflow'])
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class POSE_OT_cn_restore_visibility_v45(bpy.types.Operator):
+    """把集合的显示/隐藏还原成「第一次进饼之前」的样子"""
+    bl_idname = "pose.cn_restore_visibility_v45"
+    bl_label = "还原原始显示"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.object is not None
+                and context.object.type == 'ARMATURE')
+
+    def execute(self, context):
+        rig = context.object
+        n = restore_visibility(rig)
+        if n < 0:
+            self.report({'WARNING'}, "还没有快照 —— 先进一次饼菜单，或点「以当前为准」")
+            return {'CANCELLED'}
+        self.report({'INFO'}, "还原了 %d 个集合的显示状态" % n)
+        return {'FINISHED'}
+
+
+class POSE_OT_cn_snapshot_visibility_v45(bpy.types.Operator):
+    """把当前显示状态记为新的还原基准（手动调好之后用）"""
+    bl_idname = "pose.cn_snapshot_visibility_v45"
+    bl_label = "以当前为准"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.object is not None
+                and context.object.type == 'ARMATURE')
+
+    def execute(self, context):
+        rig = context.object
+        if not save_visibility_snapshot(rig, force=True):
+            self.report({'WARNING'}, "存不下来（骨架是只读的？）")
+            return {'CANCELLED'}
+        self.report({'INFO'}, "已记下 %d 个集合的当前状态"
+                    % len(_colls(rig)))
         return {'FINISHED'}
 
 
@@ -3573,7 +5212,7 @@ class POSE_OT_cn_first_bone_v45(bpy.types.Operator):
         if len(sel) != 1:
             self.report({'WARNING'}, "先选中恰好一根骨骼（当前选了 %d 根）" % len(sel))
             return {'CANCELLED'}
-        col = rig.data.collections.get(col_name)
+        col = _coll_get(rig, col_name)
         if col is not None and sel[0].name not in collection_bone_names(rig, col):
             self.report({'WARNING'},
                         "%s 不属于集合「%s」，先把骨骼放进集合再设" % (sel[0].name, col_name))
@@ -3789,6 +5428,447 @@ class POSE_OT_cn_book_clear_v45(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------- 独显（solo）
+#
+# 只显示一个集合的控制器，其余骨骼集合关掉可见性。快照存在骨架自己身上：
+#   rig.data["cn_solo_prev"] = {集合名: 当时的可见性}
+#   rig.data["cn_solo_col"]  = 当前独显的集合名
+# 所以「关掉再打开文件」也能还原回你原来的显示状态。
+
+_SOLO_COL_KEY = "cn_solo_col"
+_SOLO_PREV_KEY = "cn_solo_prev"
+
+
+def solo_collection_name(rig):
+    try:
+        return str(rig.data.get(_SOLO_COL_KEY, "") or "")
+    except Exception:
+        return ""
+
+
+def solo_tree(col):
+    """集合自己 + 所有子集合（Rigify 的集合是分层的）。"""
+    out = [col]
+    stack = list(col.children)
+    n = 0
+    while stack and n < 256:
+        c = stack.pop()
+        n += 1
+        out.append(c)
+        stack.extend(c.children)
+    return out
+
+
+def solo_apply(rig, col_name, commit=False):
+    """原生独显：给集合打 is_solo 星标（和骨骼集合面板的 ★ 是同一个开关）。
+
+    好处：**一个集合的 is_visible 都不动** —— 以前是把其他集合逐个
+    is_visible=False、还原时靠自己的快照写回去；现在走 Blender 原生
+    solo，取消星标后可见性由 Blender 自动还原，侧栏面板上也能直接
+    看到星标亮在哪。范围保持旧语义：目标集合 + 全部子集合一起标星
+    （Hair 这类 0 骨分组、以及 Rigify 分层，纯原生只标自己会
+    「一颗星下去什么都看不见」）。
+    """
+    col = _coll_get(rig, col_name) if col_name else None
+    if col is None:
+        return False
+    keep = set(c.name for c in solo_tree(col))
+    try:
+        for c in _colls(rig):
+            want = c.name in keep
+            if bool(c.is_solo) != want:
+                c.is_solo = want
+    except Exception:
+        return False
+    if commit:
+        try:
+            rig.data[_SOLO_COL_KEY] = col_name
+        except Exception:
+            pass
+    return True
+
+
+def solo_clear(rig, restore=True):
+    # 原生 solo：清掉星标即可 —— 各集合的 is_visible 从头到尾没被碰过，
+    # Blender 自己把显示还原回去，不需要快照。restore 参数保留旧签名。
+    try:
+        for c in _colls(rig):
+            if c.is_solo:
+                c.is_solo = False
+    except Exception:
+        pass
+    # 老版本把可见性快照存在 data 里，顺手清掉历史残留
+    for k in (_SOLO_PREV_KEY, _SOLO_COL_KEY):
+        try:
+            if k in rig.data:
+                del rig.data[k]
+        except Exception:
+            pass
+    return True
+
+
+def solo_toggle(rig, col_name, report=None):
+    """点一下只显示这个集合，再点一下（或点别的集合）还原 / 换一个。"""
+    if not col_name:
+        return ""
+    if solo_collection_name(rig) == col_name:
+        solo_clear(rig)
+        return "restore"
+    solo_apply(rig, col_name, commit=True)
+    return "solo"
+
+
+class POSE_OT_cn_solo_collection_v45(bpy.types.Operator):
+    """独显这个集合的控制器（再点一次还原）"""
+    bl_idname = "pose.cn_solo_collection_v45"
+    bl_label = "独显集合"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    collection: bpy.props.StringProperty()
+    restore: bpy.props.BoolProperty(default=False)
+
+    @classmethod
+    def poll(cls, context):
+        return pie_menu_poll(context)
+
+    def execute(self, context):
+        rig = pie_rig(context)
+        if rig is None or not edit_ok(rig):
+            return {'CANCELLED'}
+        if self.restore:
+            solo_clear(rig)
+            self.report({'INFO'}, "已还原原来的显示")
+            return {'FINISHED'}
+        res = solo_toggle(rig, self.collection, self.report)
+        if res == "restore":
+            self.report({'INFO'}, "已还原原来的显示")
+        elif res == "solo":
+            self.report({'INFO'}, "只显示「%s」" % self.collection)
+        else:
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+# ---- 星标饼（自绘）。原生饼菜单拿不到悬停事件，只有自己画才能做到
+#      「鼠标移到星标上就独显」。默认关掉：偏好里勾「星标饼」才接管热键，
+#      出问题随时切回原生饼（键位照样用）。
+
+_WHEEL_R_IN = 66.0
+_WHEEL_R_OUT = 168.0
+_WHEEL_STAR_GAP = 18.0
+_WHEEL_STAR_R = 9.0
+# 触发死区（像素）：超过它就按方向选中，**不用**滑到格子上。
+# 原生饼十几像素就高亮，这里默认 12，偏好里可调（0 = 一动就选）。
+_WHEEL_DEAD = 12.0
+_WHEEL_FONT = 13
+
+
+def _wheel_geo():
+    """从偏好取星标饼的几何参数（画和命中判定共用一份，免得对不上）。"""
+    try:
+        r_out = float(max(80, int(pref("pie_radius", _WHEEL_R_OUT))))
+        r_in = float(max(8, int(pref("pie_hole", _WHEEL_R_IN))))
+        if r_in > r_out - 36.0:
+            r_in = max(8.0, r_out - 36.0)
+        star_r = float(max(3, int(pref("pie_star_size", _WHEEL_STAR_R))))
+        dead = float(max(0, min(120, int(pref("pie_dead_zone", _WHEEL_DEAD)))))
+        font = max(8, min(24, int(pref("pie_label_size", _WHEEL_FONT))))
+    except Exception:
+        r_out, r_in, star_r, dead, font = (_WHEEL_R_OUT, _WHEEL_R_IN,
+                                          _WHEEL_STAR_R, _WHEEL_DEAD, _WHEEL_FONT)
+    return {"r_in": r_in, "r_out": r_out, "gap": _WHEEL_STAR_GAP,
+            "star_r": star_r, "dead": dead, "font": font}
+
+
+def _wheel_sector(mx, my, cx, cy, count=8):
+    """(扇区号, 半径)。扇区 0 = 正上方，顺时针。"""
+    dx, dy = mx - cx, my - cy
+    r = math.hypot(dx, dy)
+    if r < 1.0:
+        return -1, r
+    ang = math.degrees(math.atan2(dy, dx))
+    step = 360.0 / count
+    idx = int(round((90.0 - ang) / step)) % count
+    return idx, r
+
+
+def _sector_tris(cx, cy, a0, a1, r0, r1, seg=8):
+    out = []
+    for k in range(seg):
+        t0 = a0 + (a1 - a0) * k / float(seg)
+        t1 = a0 + (a1 - a0) * (k + 1) / float(seg)
+        p0 = (cx + r0 * math.cos(t0), cy + r0 * math.sin(t0))
+        p1 = (cx + r1 * math.cos(t0), cy + r1 * math.sin(t0))
+        p2 = (cx + r1 * math.cos(t1), cy + r1 * math.sin(t1))
+        p3 = (cx + r0 * math.cos(t1), cy + r0 * math.sin(t1))
+        out += [p0, p1, p2, p0, p2, p3]
+    return out
+
+
+def _star_tris(cx, cy, r_out, r_in, points=5):
+    tips = []
+    for k in range(points * 2):
+        ang = math.pi / 2 + k * math.pi / points
+        r = r_out if k % 2 == 0 else r_in
+        tips.append((cx + r * math.cos(ang), cy + r * math.sin(ang)))
+    tris = []
+    for k in range(points * 2):
+        tris += [(cx, cy), tips[k], tips[(k + 1) % (points * 2)]]
+    return tris
+
+
+class POSE_OT_cn_wheel_v45(bpy.types.Operator):
+    """星标饼：8 格集合，每格外沿一个星标 —— 松手在哪就生效在哪
+
+    一套拖拽手势（对齐原生饼）：按住给出**方向**就高亮（十几像素即触发，
+    不用滑到格子上，死区可调），松手 → 跳进集合并选中第一根骨；滑到外沿
+    星星 → 当场独显（预览），滑回格子 → 退出独显，松手在星星上 → 独显
+    定格。松手即退出饼。空格子 / 拖出饼外松手只关饼，不弹任何面板。
+    画不出来就自动退回原生饼，键位不会失效。
+    """
+    bl_idname = "pose.cn_wheel_v45"
+    bl_label = "星标饼"
+    bl_options = {'REGISTER'}
+
+    layer: bpy.props.IntProperty(default=1, min=1, max=3)
+
+    def _native(self, context):
+        menu = {1: "CN_MT_pie_v45", 2: "CN_MT_pie2_v45", 3: "CN_MT_pie3_v45"}.get(self.layer)
+        if not menu:
+            return {'CANCELLED'}
+        try:
+            bpy.ops.wm.call_menu_pie('INVOKE_DEFAULT', name=menu)
+        except Exception:
+            pass
+        return {'CANCELLED'}
+
+    def invoke(self, context, event):
+        try:
+            area = context.area
+            if area is None or area.type != 'VIEW_3D':
+                return self._native(context)
+            if getattr(event, "mouse_region_x", None) is None:
+                return self._native(context)
+            if context.window is None:
+                return self._native(context)
+        except Exception:
+            return self._native(context)
+        self._center = (event.mouse_region_x, event.mouse_region_y)
+        self._hover = -1
+        self._star_hover = -1
+        self._preview = None      # 拖拽期间预览独显的集合名（滑回格子就还原）
+        self._slots = []
+        self._names = []
+        self._handle = None
+        self._load_slots(context)
+        try:
+            self._handle = bpy.types.SpaceView3D.draw_handler_add(
+                self._draw, (), 'WINDOW', 'POST_PIXEL')
+        except Exception:
+            return self._native(context)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def _load_slots(self, context):
+        rig = pie_rig(context)
+        self._names = []
+        self._slots = []
+        if rig is None or rig.type != 'ARMATURE':
+            return
+        try:
+            groups = pie_slot_groups(rig, self.layer)
+        except Exception:
+            groups = []
+        for i in range(8):
+            grp = groups[i] if i < len(groups) else []
+            name = grp[0] if grp else ""
+            self._names.append(name)
+            self._slots.append(name)
+
+    def _draw(self):
+        try:
+            import gpu
+            import blf
+            from gpu_extras.batch import batch_for_shader
+        except Exception:
+            return
+        cx, cy = self._center
+        try:
+            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        except Exception:
+            return
+        geo = _wheel_geo()
+        r_in, r_out = geo["r_in"], geo["r_out"]
+        try:
+            gpu.state.blend_set('ALPHA')
+            # 中心孔里的方向扇：鼠标只在死区里给出方向时就靠它反馈
+            # （原生饼十几像素就高亮，不用真滑到格子上）
+            if self._hover >= 0 and self._star_hover < 0:
+                mid = math.radians(90.0 - self._hover * 45.0)
+                a0, a1 = mid - math.radians(22.5), mid + math.radians(22.5)
+                wv = _sector_tris(cx, cy, a0, a1, max(6.0, geo["dead"] * 0.8), r_in)
+                wb = batch_for_shader(shader, 'TRIS', {"pos": wv})
+                shader.bind()
+                shader.uniform_float("color", (0.24, 0.40, 0.68, 0.55))
+                wb.draw(shader)
+            for i in range(8):
+                mid = math.radians(90.0 - i * 45.0)
+                a0, a1 = mid - math.radians(22.5), mid + math.radians(22.5)
+                if i == self._star_hover:
+                    col = (0.42, 0.34, 0.12, 0.96)
+                elif i == self._hover:
+                    col = (0.24, 0.40, 0.68, 0.96)
+                else:
+                    col = (0.16, 0.17, 0.20, 0.92)
+                verts = _sector_tris(cx, cy, a0, a1, r_in, r_out)
+                batch = batch_for_shader(shader, 'TRIS', {"pos": verts})
+                shader.bind()
+                shader.uniform_float("color", col)
+                batch.draw(shader)
+                if not self._slots[i]:
+                    continue
+                sx = cx + (r_out + geo["gap"]) * math.cos(mid)
+                sy = cy + (r_out + geo["gap"]) * math.sin(mid)
+                star = _star_tris(sx, sy, geo["star_r"], geo["star_r"] * 0.42, 5)
+                sb = batch_for_shader(shader, 'TRIS', {"pos": star})
+                sc = ((1.0, 0.80, 0.28, 1.0) if i == self._star_hover
+                      else (0.66, 0.66, 0.70, 1.0))
+                shader.bind()
+                shader.uniform_float("color", sc)
+                sb.draw(shader)
+                txt = self._slots[i]
+                if len(txt) > 12:
+                    txt = txt[:11] + "…"
+                blf.size(0, geo["font"])
+                blf.color(0, 0.92, 0.93, 0.95, 1.0)
+                tx = cx + (r_in + r_out) * 0.5 * math.cos(mid)
+                ty = cy + (r_in + r_out) * 0.5 * math.sin(mid)
+                w, h = blf.dimensions(0, txt)
+                blf.position(0, tx - w * 0.5, ty - h * 0.5, 0)
+                blf.draw(0, txt)
+            gpu.state.blend_set('NONE')
+        except Exception:
+            try:
+                gpu.state.blend_set('NONE')
+            except Exception:
+                pass
+
+    def _end(self, context):
+        if self._handle is not None:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            except Exception:
+                pass
+            self._handle = None
+        return
+
+    def modal(self, context, event):
+        try:
+            if event.type == 'MOUSEMOVE':
+                mx, my = event.mouse_region_x, event.mouse_region_y
+                geo = _wheel_geo()
+                idx, r = _wheel_sector(mx, my, self._center[0], self._center[1])
+                self._r = r
+                # ★ 原生饼手感：给出方向就算选中，不用滑到格子上。
+                #   只有死区（默认 12 px，偏好可调）里才不选。
+                if r < geo["dead"]:
+                    idx = -1
+                elif r > geo["r_out"] + geo["gap"] + geo["star_r"] + 12:
+                    idx = -1            # 拖太远 = 放弃，不误选
+                star = -1
+                if idx >= 0 and r >= geo["r_out"] - 4:
+                    star = idx          # 外圈 = 星标（独显这一格）
+                changed = (idx != self._hover) or (star != self._star_hover)
+                self._hover, self._star_hover = idx, star
+                # 滑到星星 = 预览独显；滑回格子/中心 = 退出独显（松手才落定）
+                try:
+                    rig = pie_rig(context)
+                except Exception:
+                    rig = None
+                pv = None
+                if rig is not None and star >= 0:
+                    nm = self._names[star] if star < len(self._names) else ""
+                    if nm:
+                        pv = nm
+                if pv != self._preview:
+                    try:
+                        if pv:
+                            solo_apply(rig, pv, commit=False)
+                        else:
+                            solo_clear(rig, restore=True)
+                    except Exception:
+                        pass
+                    self._preview = pv
+                    changed = True
+                if changed and context.area is not None:
+                    context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+            if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+                self._end(context)
+                # 换层：直接重开，热键手感一致
+                nxt = self.layer + (1 if event.type == 'WHEELUPMOUSE' else -1)
+                if nxt < 1:
+                    nxt = 3
+                if nxt > 3:
+                    nxt = 1
+                self.layer = nxt
+                self._load_slots(context)
+                return {'RUNNING_MODAL'}
+            if event.type == 'LEFTMOUSE':
+                if event.value != 'RELEASE':
+                    return {'RUNNING_MODAL'}
+                star, hover = self._star_hover, self._hover
+                name = self._names[star] if 0 <= star < len(self._names) else ""
+                self._end(context)
+                rig = pie_rig(context)
+                if rig is not None and star >= 0 and name:
+                    # 松手在星星上 = 独显定格；开饼前就已独显这格 → 还原
+                    if self._preview == name:
+                        solo_apply(rig, name, commit=True)
+                    elif solo_collection_name(rig) == name:
+                        solo_clear(rig)
+                    else:
+                        solo_apply(rig, name, commit=True)
+                    self._preview = None
+                    return {'FINISHED'}
+                if rig is not None and self._preview is not None:
+                    # 滑回格子后松手 = 先退出独显，再跳集合
+                    solo_clear(rig, restore=True)
+                    self._preview = None
+                if rig is not None and hover >= 0:
+                    nm = self._names[hover] if hover < len(self._names) else ""
+                    if nm:
+                        # 松手即选中：跳进集合并选第一根（顺序表指定者优先）
+                        enter_pie_collection(context, rig, nm, self.layer)
+                        return {'FINISHED'}
+                # 空格子 / 拖出饼外松手：直接关，不弹任何面板
+                return {'CANCELLED'}
+            if event.type in {'RIGHTMOUSE', 'ESC', 'MIDDLEMOUSE'}:
+                self._end(context)
+                try:
+                    rig = pie_rig(context)
+                    if rig is not None and getattr(self, "_preview", None):
+                        solo_clear(rig, restore=True)
+                        self._preview = None
+                except Exception:
+                    pass
+                return {'CANCELLED'}
+        except Exception:
+            try:
+                self._end(context)
+            except Exception:
+                pass
+            try:
+                rig = pie_rig(context)
+                if rig is not None and getattr(self, "_preview", None):
+                    solo_clear(rig, restore=True)
+                    self._preview = None
+            except Exception:
+                pass
+            return self._native(context)
+        return {'RUNNING_MODAL'}
+
+
 def _pie_draw_layer(self, context, layer):
     """三层饼共用的绘制主体。
 
@@ -3816,7 +5896,7 @@ def _pie_draw_layer(self, context, layer):
     try:
         slots = pie_slots(rig, layer)
         cur = pie_current_collection(rig)
-        cols = rig.data.collections
+        cols = _colls(rig)
     except Exception:
         slots, cur, cols = [""] * 8, "", None
 
@@ -3833,10 +5913,14 @@ def _pie_draw_layer(self, context, layer):
                           'ERROR'))
         elif not name:
             items.append(("＋ %s" % PIE_DIRS[i], "pose.cn_pie_assign_v45",
-                          {"slot": i, "layer": layer}, 'ADD'))
+                          {"slot": i, "layer": layer,
+                           "collection": "", "from_popup": False,
+                           "remove": False, "append": False}, 'ADD'))
         elif cols.get(name) is None:
             items.append(("%s · 集合已丢失" % name, "pose.cn_pie_assign_v45",
-                          {"slot": i, "layer": layer}, 'ERROR'))
+                          {"slot": i, "layer": layer,
+                           "collection": "", "from_popup": False,
+                           "remove": False, "append": False}, 'ERROR'))
         else:
             text = ("● " + name) if name == cur else name
             items.append((text, "pose.cn_pie_jump_v45",
@@ -3880,6 +5964,265 @@ class CN_MT_pie3_v45(bpy.types.Menu):
 
     def draw(self, context):
         _pie_draw_layer(self, context, 3)
+
+
+class POSE_OT_cn_bone_order_v45(bpy.types.Operator):
+    """调整集合里骨骼的**导航顺序**：上移/下移/置顶/移出顺序表/恢复原序
+
+    排第一的那根，就是进这个集合时先被选中的那根，也是 ↑↓ / 滚轮走到这个
+    集合时停的第一站。挪完会顺手把集合排序切到「集合顺序」—— 否则
+    「空间排序 / 手指排序」会把它盖掉，用户会以为按钮没反应。
+    """
+    bl_idname = "pose.cn_bone_order_v45"
+    bl_label = "调整骨骼顺序"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    collection: bpy.props.StringProperty()
+    bone: bpy.props.StringProperty()
+    delta: bpy.props.IntProperty(default=0)
+    to_index: bpy.props.IntProperty(default=-1)
+    remove: bpy.props.BoolProperty(default=False, name="移出顺序表")
+    reset: bpy.props.BoolProperty(default=False, name="恢复原顺序")
+
+    @classmethod
+    def poll(cls, context):
+        return pie_menu_poll(context)
+
+    def execute(self, context):
+        rig = pie_rig(context)
+        if rig is None or not edit_ok(rig):
+            return {'CANCELLED'}
+        col = _coll_get(rig, self.collection) if self.collection else None
+        if col is None:
+            return {'CANCELLED'}
+        if self.reset:
+            if set_bone_order(rig, col.name, []):
+                self.report({'INFO'}, "「%s」已恢复 assign 原顺序" % col.name)
+                return {'FINISHED'}
+            self.report({'WARNING'}, "这根骨架是只读的，改不了顺序")
+            return {'CANCELLED'}
+        names = list(collection_bone_names(rig, col))
+        if not names:
+            return {'CANCELLED'}
+        # 没点名就用当前选中的那根 —— 长集合不用翻到底也能一键排到第一
+        bone = self.bone
+        if not bone:
+            act = rig.data.bones.active
+            bone = act.name if act is not None else ""
+        if not bone or bone not in names:
+            self.report({'WARNING'}, "先选中集合「%s」里的一根骨骼" % col.name)
+            return {'CANCELLED'}
+        i = names.index(bone)
+        if self.remove:
+            names.pop(i)
+            names.append(bone)          # 掉到末尾：既不丢骨，也回到「没排过」的状态
+            if not write_bone_order(rig, col, names, self.report):
+                return {'CANCELLED'}
+            self.report({'INFO'}, "%s 已移出顺序表（排到最后）" % bone)
+            return {'FINISHED'}
+        if self.to_index >= 0:
+            j = max(0, min(len(names) - 1, self.to_index))
+        else:
+            j = max(0, min(len(names) - 1, i + self.delta))
+        if i == j:
+            return {'CANCELLED'}
+        names.insert(j, names.pop(i))
+        if not write_bone_order(rig, col, names, self.report):
+            return {'CANCELLED'}
+        self.report({'INFO'}, "%s → 第 %d 位（共 %d 根）" % (bone, j + 1, len(names)))
+        return {'FINISHED'}
+
+
+class POSE_OT_cn_bone_order_batch_v45(bpy.types.Operator):
+    """批量排集合顺序：链式收录 / 框选排序 / 按编号展开 / 反转 / 自然序 / 还原
+
+    这四个「填」的方式都是把新排的一段放最前、其余成员按原顺序跟在后面，
+    所以不会把没选到的骨骼从表里弄丢。
+    """
+    bl_idname = "pose.cn_bone_order_batch_v45"
+    bl_label = "批量排骨骼顺序"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    collection: bpy.props.StringProperty()
+    mode: bpy.props.EnumProperty(items=(
+        ('CHAIN', "链式收录", "从选中的链头沿父子一路收到底"),
+        ('TOPOLOGY', "框选排序", "按「父先于子 + 编号自然序」排选中的骨骼"),
+        ('SERIES', "按编号展开", "从当前骨骼的编号展开整条序列"),
+        ('REVERSE', "反转顺序", "把当前顺序倒过来"),
+        ('NATURAL', "按名字排序", "只按名字的自然序（01 在 10 前面）"),
+        ('RESET', "恢复原顺序", "删掉自定义顺序，回到 assign 原序"),
+    ), default='CHAIN')
+
+    @classmethod
+    def poll(cls, context):
+        return pie_menu_poll(context)
+
+    def execute(self, context):
+        rig = pie_rig(context)
+        if rig is None or not edit_ok(rig):
+            return {'CANCELLED'}
+        col = _coll_get(rig, self.collection) if self.collection else None
+        if col is None:
+            self.report({'WARNING'}, "找不到这个集合")
+            return {'CANCELLED'}
+        members = collection_members(rig, col)
+        if not members:
+            self.report({'WARNING'}, "「%s」里没有骨骼" % col.name)
+            return {'CANCELLED'}
+        if self.mode == 'RESET':
+            set_bone_order(rig, col.name, [])
+            self.report({'INFO'}, "「%s」已恢复 assign 原顺序" % col.name)
+            return {'FINISHED'}
+        if self.mode == 'REVERSE':
+            cur = list(collection_bone_names(rig, col))
+            cur.reverse()
+            return self._done(rig, col, cur, "反转")
+        if self.mode == 'NATURAL':
+            cur = sorted(collection_bone_names(rig, col), key=natural_key)
+            return self._done(rig, col, cur, "按名字")
+
+        sel = selected_names(rig)
+        act = rig.data.bones.active
+        seed = act.name if act is not None else ""
+        if self.mode == 'CHAIN':
+            roots = [n for n in sel if n in set(members)] or ([seed] if seed else [])
+            if not roots:
+                self.report({'WARNING'}, "先选中链头那根骨骼（只选一根就够）")
+                return {'CANCELLED'}
+            roots.sort(key=natural_key)
+            got = order_chain_names(rig, col, roots)
+            if len(got) < 2:
+                self.report({'WARNING'}, "这条链在「%s」里只有 %d 根 —— 换个链头，"
+                                         "或先用「框选排序」" % (col.name, len(got)))
+                return {'CANCELLED'}
+            return self._done(rig, col, order_merge(rig, col, got), "链式收录", len(got))
+        if self.mode == 'TOPOLOGY':
+            pool = [n for n in sel if n in set(members)] or list(members)
+            got = order_topology_names(rig, col, pool)
+            return self._done(rig, col, got, "框选排序", len(got))
+        if self.mode == 'SERIES':
+            if not seed:
+                self.report({'WARNING'}, "先选中一根带编号的骨骼（如 hair_fk.001）")
+                return {'CANCELLED'}
+            got = order_series_names(rig, col, seed)
+            if len(got) < 2:
+                self.report({'WARNING'}, "%s 没有可展开的编号序列（同前后缀只有一根）" % seed)
+                return {'CANCELLED'}
+            return self._done(rig, col, order_merge(rig, col, got), "按编号展开", len(got))
+        return {'CANCELLED'}
+
+    def _done(self, rig, col, names, what, count=None):
+        if not write_bone_order(rig, col, names, self.report):
+            return {'CANCELLED'}
+        self.report({'INFO'}, "「%s」%s：%d 根已排好" % (col.name, what, count or len(names)))
+        return {'FINISHED'}
+
+
+# ---- 点选排序（v5.2.6）：唯一的顺序录入方式 ------------------------------
+# Blender 不保存选中顺序（selected_pose_bones 永远按骨架内部先后返回），
+# 所以用一个 0.12 秒的后台计时器盯「当前骨骼」：谁变成当前骨骼谁进队尾。
+# 不是模态 —— 点一下开始，你照常加选，点回来写入，中间不打断任何操作。
+_PICK_ORDER = {"armed": False, "rig": "", "col": "", "members": set(),
+               "queue": [], "last": "", "timer_on": False}
+
+
+def _pick_order_tick():
+    """点选排序的心跳：活动骨骼一变就往队尾加一根。"""
+    st = _PICK_ORDER
+    if not st["armed"]:
+        st["timer_on"] = False
+        return None                      # 返回 None = 注销计时器
+    rig = bpy.data.objects.get(st["rig"])
+    col = _coll_get(rig, st["col"]) if rig is not None else None
+    if rig is None or col is None or bpy.context.mode != 'POSE':
+        st["armed"] = False
+        st["timer_on"] = False
+        return None
+    act = rig.data.bones.active
+    name = act.name if act is not None else ""
+    if name and name != st["last"]:
+        st["last"] = name
+        if name in st["members"] and name not in st["queue"]:
+            st["queue"].append(name)
+    return 0.12
+
+
+def _pick_order_timer(on):
+    st = _PICK_ORDER
+    if on:
+        if not st["timer_on"]:
+            try:
+                bpy.app.timers.register(_pick_order_tick, first_interval=0.12,
+                                        persistent=True)
+                st["timer_on"] = True
+            except Exception:
+                st["timer_on"] = False
+    else:
+        st["armed"] = False
+        if st["timer_on"]:
+            try:
+                bpy.app.timers.unregister(_pick_order_tick)
+            except Exception:
+                pass
+            st["timer_on"] = False
+
+
+class POSE_OT_cn_bone_order_pick_v45(bpy.types.Operator):
+    """点选排序：按你一根一根加选的先后写集合顺序
+
+    点第一下 = 开始记录（开始前只选了一根时，它算第 1 根）；
+    然后在视图里正常加选，谁被点谁排后面；
+    点第二下 = 写入。
+    """
+    bl_idname = "pose.cn_bone_order_pick_v45"
+    bl_label = "点选排序"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    collection: bpy.props.StringProperty()
+
+    @classmethod
+    def poll(cls, context):
+        return pie_menu_poll(context)
+
+    def execute(self, context):
+        rig = pie_rig(context)
+        if rig is None or not edit_ok(rig):
+            return {'CANCELLED'}
+        col = _coll_get(rig, self.collection) if self.collection else None
+        if col is None:
+            self.report({'WARNING'}, "找不到这个集合")
+            return {'CANCELLED'}
+        st = _PICK_ORDER
+        armed = st["armed"] and st["rig"] == rig.name and st["col"] == col.name
+        if armed:
+            # 第二下：写入（一根都没点 = 取消）
+            _pick_order_timer(False)
+            queue = [n for n in st["queue"] if n in st["members"]]
+            if not queue:
+                self.report({'INFO'}, "一根都没点，已取消，顺序没改")
+                return {'CANCELLED'}
+            if not write_bone_order(rig, col, order_merge(rig, col, queue),
+                                    self.report):
+                return {'CANCELLED'}
+            self.report({'INFO'}, "按点选顺序写入 %d 根（「%s」）"
+                        % (len(queue), col.name))
+            return {'FINISHED'}
+        # 第一下：开始记录
+        st["rig"] = rig.name
+        st["col"] = col.name
+        st["members"] = set(collection_members(rig, col))
+        st["queue"] = []
+        act = rig.data.bones.active
+        st["last"] = act.name if act is not None else ""
+        sel = [pb.name for pb in rig.pose.bones if pb.select]
+        if len(sel) == 1 and sel[0] in st["members"]:
+            # 按按钮前你已经选好了第 1 根：把它记进队列
+            st["queue"].append(sel[0])
+        st["armed"] = True
+        _pick_order_timer(True)
+        tip = ("（第 1 根已记：%s）" % st["queue"][0]) if st["queue"] else ""
+        self.report({'INFO'}, "开始记录：去视图里一根一根加选，点完再按一次「点选排序」写入" + tip)
+        return {'FINISHED'}
 
 
 class POSE_OT_cn_preset_menu_v45(bpy.types.Operator):
@@ -3997,6 +6340,17 @@ class POSE_OT_controller_nav_v45(bpy.types.Operator):
             self.report({'WARNING'}, "请在 Pose Mode 下选中骨架")
             return {'CANCELLED'}
 
+        # v5.2.15：旋转/移动进行中切骨骼，个别 RNA 访问会带出 SystemError
+        # （"returned a result with an exception set"）—— 捕获后按普通提示报，
+        # 不再往信息栏甩原始异常。
+        _error_wash()   # v5.2.16：进来先清 C 层静默残留
+        try:
+            return self._nav(context, rig)
+        except Exception as exc:
+            self.report({'WARNING'}, "导航失败：%s" % exc)
+            return {'CANCELLED'}
+
+    def _nav(self, context, rig):
         cur = rig.data.bones.active
 
         if cur is None:
@@ -4563,6 +6917,26 @@ def _apply_visible_rotation(pb, parent_m, m_start, basis_st, pivot, quat):
     pb.matrix_basis = D @ basis_st
 
 
+def _apply_visible_translation(pb, parent_m, m_start, basis_st, delta):
+    """让「可见姿态」在 armature 空间整体平移 delta（约束偏移 K 一起带上）。
+
+    和 _apply_visible_rotation 同一个套路：可见 M = K · P · basis，要让 M 变成
+    T·M，就得让 basis 左乘 P⁻¹ · K⁻¹ · T · K · P。K 是单位阵时退化成
+    P⁻¹·T·P，等价于写 `pb.matrix = T @ m`。
+
+    为什么不能直接写 `pb.matrix`：ARP 的 c_foot_ik / c_hand_ik 挂 Child Of(c_traj)，
+    可见矩阵由约束求出，而 `pb.matrix` 的 setter 只按 rest 关系反解 basis、不认约束。
+    只要 c_traj 不是单位姿态（动了根部/重心），"读出来再写回去"就会把 c_traj 的
+    那份偏移再叠一遍 —— 实测 0.62m，就是「脚 IK 第一下拖动整条腿弹起来」。
+    """
+    K = _visible_offset(parent_m, m_start, basis_st)
+    if K is None:
+        K = Matrix.Identity(4)
+    T = Matrix.Translation(delta)
+    D = parent_m.inverted() @ K.inverted() @ T @ K @ parent_m
+    pb.matrix_basis = D @ basis_st
+
+
 def _restore_to_start(pb, parent_m, m_start, basis_st=None):
     """把姿态还原到基线（等于不转）。
 
@@ -4637,13 +7011,17 @@ def _bone_point_world(rig, pb, matrix_basis, local_offset):
 
     matrix_basis 是「假设姿态」= 只推演、不落盘；自动判轴靠这个试探三根轴
     各自会把骨骼推向屏幕的哪个方向。
+
+    v5.2.25 修复：原来写的是 `parent.matrix @ basis @ bone.matrix_local`，
+    既少了父级 rest 的还原（`parent.bone.matrix_local⁻¹`），又把 basis 放到了
+    错误的一侧。实测（插件测试 根部控制器…blend）脊椎/手臂/头部偏 1.4~1.9
+    个单位（≈5 个骨长），判轴方向错 93°~180°，屏幕长度跟着乱 —— 灵敏度会
+    随根骨（大环）的变换漂移，拖第一下就容易"跳"。正确式子是 armature 空间的
+    P·basis（P 的定义见 _parent_matrix）。
     """
     basis = pb.matrix_basis.copy() if matrix_basis is None else matrix_basis
     try:
-        m = basis @ pb.bone.matrix_local
-        parent = pb.parent
-        if parent is not None:
-            m = parent.matrix @ m
+        m = _parent_matrix(pb) @ basis
     except Exception:
         m = pb.matrix
     return rig.matrix_world @ (m @ local_offset)
@@ -4773,6 +7151,7 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
         self._scale_mouse = (0, 0)
         self._scale_factor = 1.0
         self._primed = False    # 第一次 MOUSEMOVE 只更新参考点，不当成输入
+        self._moved_any = False  # 本段（切模式/切轴/切骨骼为界）是否已吃进过输入
         self._handle = None
         self._cursor_hidden = False
         self._rx = 0            # 指针在 region 内的坐标（HUD 用）
@@ -5137,7 +7516,14 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
                         loc0 = base[1].to_translation()
                     b.location = loc0 + local_d
                 else:
-                    b.matrix = Matrix.Translation(world_d) @ base[0]
+                    P = _parent_matrix(b)
+                    if (base[1] is not None
+                            and _constraint_shifts(P, base[0], base[1])):
+                        # 可见姿态被约束改写过（Child Of 等）：直接写 matrix 会把
+                        # 那层偏移再叠一遍，首帧整根控制器就弹走。改走带 K 的共轭。
+                        _apply_visible_translation(b, P, base[0], base[1], world_d)
+                    else:
+                        b.matrix = Matrix.Translation(world_d) @ base[0]
             except Exception:
                 pass
         # 移动也要记账：不记的话下一次 _ensure_baseline 会把这帧位移当成
@@ -5265,8 +7651,13 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
                 if base is None:
                     continue
                 try:
-                    b.matrix = Matrix.Translation(
-                        self._lock_filter(b, pend)) @ base[0]
+                    d = self._lock_filter(b, pend)
+                    P = _parent_matrix(b)
+                    if (base[1] is not None
+                            and _constraint_shifts(P, base[0], base[1])):
+                        _apply_visible_translation(b, P, base[0], base[1], d)
+                    else:
+                        b.matrix = Matrix.Translation(d) @ base[0]
                 except Exception:
                     pass
             bpy.context.view_layer.update()
@@ -5315,7 +7706,7 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
     def _pose_matches(self, snap, eps=1e-6):
         """当前姿态和快照是否一致（用来判断"这一步还能不能退"）。"""
         for name, mat in snap.items():
-            pb = self._rig.pose.bones.get(name)
+            pb = _pb_get(self._rig, name)
             if pb is None:
                 continue
             cur = pb.matrix_basis
@@ -5806,6 +8197,7 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
             self._parent_m = _parent_matrix(pb)
             self._pivot = _pivot_armature_space(context, self._rig, pb)
             self._start = pb.matrix_basis.copy()
+        self._moved_any = False            # 新一段手势，第一条大位移仍要重新取参考点
         self._quat = Quaternion()          # TRACKBALL 的绝对旋转归零（已进基线）
         self._quat0 = Quaternion()
         self._track_dx = 0.0
@@ -6008,6 +8400,7 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
                 pb.keyframe_insert("scale", frame=frame)
             except Exception:
                 pass
+        _error_wash()
 
     # ---- 自动判轴
 
@@ -6231,14 +8624,21 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
     # ---- 灵敏度 / 指针回绕
 
     def _screen_len(self, context):
-        """骨骼在屏幕上的投影长度（像素），用来归一化灵敏度。"""
+        """骨骼在屏幕上的投影长度（像素），用来归一化灵敏度。
+
+        v5.2.25：直接投骨骼可见的头 / 尾两个端点。原来投的是"头 + 沿局部 Y
+        一个骨长"的推演点，一旦父级链换算有偏差（见 _bone_point_world），
+        长度就会随根骨的旋转变来变去 —— 同样手拖 10px，转角能差 30%，
+        表现就是"根环转过之后手感突然变了 / 第一下跳"。头尾投影没有这个
+        推演环节，长度恒等于肉眼看到的骨长。
+        """
         region, rv3d = _view_pair(context)
         if region is None or rv3d is None:
             return ROT_REF_PX
-        pts = _probe_offsets(self._pb)
-        m = self._rig.matrix_world @ self._pb.matrix
-        p0 = _screen_of(region, rv3d, m.translation.copy())
-        p1 = _screen_of(region, rv3d, _bone_point_world(self._rig, self._pb, None, pts[0]))
+        pb = self._pb
+        mw = self._rig.matrix_world
+        p0 = _screen_of(region, rv3d, mw @ pb.head)
+        p1 = _screen_of(region, rv3d, mw @ pb.tail)
         if p0 is None or p1 is None:
             return ROT_REF_PX
         return max((p1 - p0).length, ROT_MIN_PX)
@@ -6576,12 +8976,13 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
         rig = self._rig
         if rig is not None and rig.type == 'ARMATURE':
             for name, hidden in saved.items():
-                pb = rig.pose.bones.get(name)
+                pb = _pb_get(rig, name)
                 if pb is not None:
                     try:
                         pb.hide = hidden
                     except Exception:
                         pass
+        _error_wash()
         if forget:
             self._solo_saved = None
 
@@ -6624,6 +9025,10 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
             self._insert_keys(context)
         except Exception:
             pass
+        # v5.2.16：上面的 RNA 写入（pb.hide / keyframe_insert）在 Blender 5.x
+        # 下可能静默挂异常不抛 —— 不冲刷的话下一个 .get 就报 SystemError
+        # "returned a result with an exception set"（用户截图里的刷屏就是这个）。
+        _error_wash()
         target = nav_neighbor_name(self._rig, self._pb.name, step)
         if not target or target == self._pb.name:
             return False
@@ -6635,7 +9040,7 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
         auto_move = False
         auto_rotate = False
         for _ in range(256):
-            cand = self._rig.pose.bones.get(target)
+            cand = _pb_get(self._rig, target)
             if cand is None:
                 return False
             if self._kind == 'ROT':
@@ -6746,7 +9151,7 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
         if not ok:
             self.report({'WARNING'}, msg)
             return False
-        pb = self._rig.pose.bones.get(self._rig.data.bones.active.name) \
+        pb = _pb_get(self._rig, self._rig.data.bones.active.name) \
             if self._rig.data.bones.active else None
         if pb is None:
             return False
@@ -6867,6 +9272,24 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
             self._rx = event.mouse_region_x
             self._ry = event.mouse_region_y
 
+            # v5.2.25：参考点错位守卫。指针被外部挪过（warp、边缘回绕、
+            # 窗口焦点切换、滚轮切骨骼后指针落点）时，第一帧的 dx/dy 会是
+            # 整块屏幕的距离；原样吃下去就是「拖第一下骨骼跳到别处」。
+            # 本段第一次有效输入若超过视口三分之一，丢掉这一帧当参考点重取
+            # —— 正常拖动第一帧只有几像素，不会误伤。
+            if not getattr(self, '_moved_any', False):
+                span = math.hypot(dx, dy)
+                limit = 120.0
+                try:
+                    if context.region is not None:
+                        limit = max(120.0, 0.35 * context.region.height)
+                except Exception:
+                    pass
+                if span > limit:
+                    self._header(context)
+                    return {'RUNNING_MODAL'}
+            self._moved_any = True
+
             # 吸附档：Ctrl = 偏好里的角度（trackball 不吸附，没有单一角度可吸）
             if event.ctrl and self._kind == 'ROT' and self._mode != 'TRACKBALL':
                 self._snap_step = 15.0 if event.shift else float(pref('snap_deg', 5) or 5)
@@ -6940,13 +9363,24 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
             if wheel_act == 'COLL':
                 if self._kind == 'MOVE':
                     self._move_flush(context)
-                self._switch_collection(context, step)
+                # v5.2.15：切集合出错只报提示，模态继续 —— 原来异常一路
+                # 冒到 modal() 的兜底，整个旋转/移动被踢掉（切到一半的
+                # 姿态也跟着中断），比切不动严重得多。
+                _error_wash()   # v5.2.16：同 BONE，先清静默异常
+                try:
+                    self._switch_collection(context, step)
+                except Exception as exc:
+                    self.report({'WARNING'}, "切集合失败（模态继续）：%s" % exc)
                 self._header(context)
                 return {'RUNNING_MODAL'}
             if wheel_act == 'BONE':
                 if self._kind == 'MOVE':
                     self._move_flush(context)
-                self._switch_bone(context, step, extend=event.shift)
+                _error_wash()   # 拖拽阶段的静默异常会毒化下一个 RNA 读
+                try:
+                    self._switch_bone(context, step, extend=event.shift)
+                except Exception as exc:
+                    self.report({'WARNING'}, "切骨骼失败（模态继续）：%s" % exc)
                 self._header(context)
                 return {'RUNNING_MODAL'}
             if wheel_act == 'AXIS':
@@ -7098,8 +9532,12 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
 # ---------------------------------------------------------------- Rigify IK/FK
 
 _RIG_OP_RE = re.compile(r"operator\('(pose\.rigify_[a-z0-9_]+)',\s*text='([^']+)'")
+_RIG_ANY_ID_RE = re.compile(
+    r"pose\.rigify_(?:limb_ik2fk|limb_fk2ik|generic_snap|finger_fk2ik)_([A-Za-z0-9_.\-]+)")
 _RIG_PROP_RE = re.compile(r"props\.([a-z_]+)\s*=\s*(.+)$")
-_RIG_IKFK_PROP_RE = re.compile(r"pose_bones\['([^']+)'\].*IK_FK")
+_RIG_IKFK_PROP_RE = re.compile(
+    r"pose_bones\[['\"]([^'\"]+)['\"]\][^\n]*?\[['\"](IK_FK|FK_IK)['\"]\]")
+_RIG_PROP_LABEL_RE = re.compile(r"text\s*=\s*['\"][^'\"]*\(([^)]+)\)['\"]")
 
 
 def _read_op_props(lines, start):
@@ -7123,22 +9561,37 @@ def _read_op_props(lines, start):
 def rigify_limbs(rig):
     """解析 rig 自带的 rig_ui.py，拿到 Rigify 原生 snap 按钮的完整参数。
 
-    返回 label → {label, prop_bone, to_ik_op, to_ik, to_fk_op, to_fk}
+    返回 label → {label, prop_bone, prop_name, to_ik_op, to_ik, to_fk_op, to_fk}
+
+    v5.2：手指也带 IK/FK（`Finger IK (f_index.01.L)`），属性叫 `FK_IK`，
+    而且两个按钮分别是 `rigify_finger_fk2ik_*` 和 `rigify_generic_snap_*`。
+    以前只认 `IK_FK` 这一个属性名，手指那 10 条全被漏掉。
     """
     if rig is None or rig.type != 'ARMATURE':
         return []
-    if not rig.data.get("rig_id"):
-        return []
-    rid = rig.data.get("rig_id")
-    source = None
+    rid = rig.data.get("rig_id") or ""
+    texts = []
     for text in bpy.data.texts:
         try:
-            s = text.as_string()
+            texts.append(text.as_string())
         except Exception:
             continue
-        if ("pose.rigify_limb_ik2fk_" + rid) in s or ("pose.rigify_generic_snap_" + rid) in s:
-            source = s
-            break
+    source = None
+    if rid:
+        for s in texts:
+            if ("pose.rigify_limb_ik2fk_" + rid) in s or ("pose.rigify_generic_snap_" + rid) in s \
+                    or ("pose.rigify_finger_fk2ik_" + rid) in s:
+                source = s
+                break
+    if source is None:
+        # 没有 rig_id（自定义绑定常会清掉，或者生成后又换了骨架）：直接从 UI
+        # 文本里反推 rig_id —— 只要文本里有 rigify 的 snap 按钮就认它。
+        for s in texts:
+            m = _RIG_ANY_ID_RE.search(s)
+            if m:
+                rid = m.group(1)
+                source = s
+                break
     if source is None:
         return []
     lines = source.splitlines()
@@ -7148,9 +9601,9 @@ def rigify_limbs(rig):
     for i, line in enumerate(lines):
         m = _RIG_IKFK_PROP_RE.search(line)
         if m:
-            lm = re.search(r"IK-FK \(([^)]+)\)", line)
+            lm = _RIG_PROP_LABEL_RE.search(line)
             if lm:
-                prop_map[lm.group(1)] = m.group(1)
+                prop_map[lm.group(1)] = (m.group(1), m.group(2))
         m = _RIG_OP_RE.search(line)
         if not m:
             continue
@@ -7170,8 +9623,11 @@ def rigify_limbs(rig):
             if props.get("prop_bone"):
                 item["prop_bone"] = props["prop_bone"]
     for label, item in limbs.items():
-        item.setdefault("prop_bone", prop_map.get(label, ""))
-    return [v for v in limbs.values() if v.get("prop_bone") and v.get("to_ik_op") and v.get("to_fk_op")]
+        if not item.get("prop_bone") and label in prop_map:
+            item["prop_bone"] = prop_map[label][0]
+            item["prop_name"] = prop_map[label][1]
+    return [v for v in limbs.values()
+            if v.get("prop_bone") and v.get("to_ik_op") and v.get("to_fk_op")]
 
 
 def rigify_limb_mode(rig, label):
@@ -7204,22 +9660,24 @@ _IKFK_CACHE = {}
 
 class CN_Limb(object):
     """一个肢体：一个开关 + 两套控制器 + 两次矩阵快照。"""
-    __slots__ = ("label", "prop_bone", "prop_name", "fk_value",
+    __slots__ = ("label", "prop_bone", "prop_name", "fk_value", "ik_value",
                  "ik_controls", "fk_controls",
                  "pairs_to_fk", "pairs_to_ik",
-                 "rigify_to_fk", "rigify_to_ik")
+                 "rigify_to_fk", "rigify_to_ik", "is_finger")
 
     def __init__(self):
         self.label = ""
         self.prop_bone = ""
         self.prop_name = "IK_FK"
         self.fk_value = 1.0
+        self.ik_value = 0.0
         self.ik_controls = []
         self.fk_controls = []
         self.pairs_to_fk = []
         self.pairs_to_ik = []
         self.rigify_to_fk = None
         self.rigify_to_ik = None
+        self.is_finger = False
 
 
 def _as_bone_list(raw):
@@ -7233,6 +9691,20 @@ def _as_bone_list(raw):
     except Exception:
         return []
     return [str(x) for x in val] if isinstance(val, list) else []
+
+
+def _as_names(raw):
+    """单个骨骼名（'f_index.01_ik.L'）和 JSON 清单都吃。"""
+    if not raw:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(x) for x in raw]
+    s = str(raw).strip()
+    if not s:
+        return []
+    if s.startswith("["):
+        return _as_bone_list(s)
+    return [s]
 
 
 def _chain_depth(pb):
@@ -7256,18 +9728,36 @@ def _limbs_rigify(rig):
     for info in rigify_limbs(rig):
         to_fk = info.get("to_fk") or {}
         to_ik = info.get("to_ik") or {}
-        fk = _as_bone_list(to_fk.get("fk_bones")) or \
-            _as_bone_list(to_ik.get("output_bones"))
-        ik = (_as_bone_list(to_fk.get("ctrl_bones"))
-              + _as_bone_list(to_fk.get("tail_bones"))
-              + _as_bone_list(to_fk.get("extra_ctrls")))
-        if not ik:
-            ik = _as_bone_list(to_ik.get("ctrl_bones"))
         lb = CN_Limb()
         lb.label = info.get("label") or info.get("prop_bone", "?")
         lb.prop_bone = info.get("prop_bone", "")
-        lb.prop_name = "IK_FK"
-        lb.fk_value = 1.0
+        pname = info.get("prop_name") or "IK_FK"
+        pb = rig.pose.bones.get(lb.prop_bone)
+        if pb is not None and pname not in pb:
+            pname = "FK_IK" if "FK_IK" in pb else pname
+        lb.prop_name = pname
+        # IK_FK：1 = FK；FK_IK（Rigify 手指）：1 = IK —— 两者的语义是反的
+        if pname == "FK_IK":
+            lb.fk_value, lb.ik_value = 0.0, 1.0
+        else:
+            lb.fk_value, lb.ik_value = 1.0, 0.0
+        # 手指的那套按钮是 finger_fk2ik / generic_snap，参数名不一样：
+        # ik_control / fk_master / fk_chain / ik_chain / constraint_bone
+        finger = bool(to_ik.get("fk_master") or to_ik.get("ik_control"))
+        if finger:
+            lb.is_finger = True
+            ik = _as_names(to_ik.get("ik_control")) or \
+                _as_names(to_fk.get("output_bones"))
+            fk = _as_names(to_ik.get("fk_master")) or \
+                _as_names(to_fk.get("input_bones"))
+        else:
+            fk = _as_names(to_fk.get("fk_bones")) or \
+                _as_names(to_ik.get("output_bones"))
+            ik = (_as_names(to_fk.get("ctrl_bones"))
+                  + _as_names(to_fk.get("tail_bones"))
+                  + _as_names(to_fk.get("extra_ctrls")))
+            if not ik:
+                ik = _as_names(to_ik.get("ctrl_bones"))
         lb.fk_controls = [n for n in dict.fromkeys(fk)
                           if rig.pose.bones.get(n) is not None]
         lb.ik_controls = [n for n in dict.fromkeys(ik)
@@ -7279,6 +9769,91 @@ def _limbs_rigify(rig):
             lb.rigify_to_ik = (info["to_ik_op"], to_ik)
         if lb.ik_controls and lb.fk_controls:
             out.append(lb)
+    return out
+
+
+# ---- Rigify 结构兜底（没有 rig_ui.py 文本也认得出肢体）
+#
+# 自定义绑定十有八九是「Rigify 生成后大改」：rig_ui 文本被删掉、rig_id 对不上，
+# 或者手搓但沿用 Rigify 命名（upper_arm_fk / thigh_ik / *_parent）。这时候按
+# 按钮参数解析那条路一条都用不上，退回按**骨架结构**认：
+#
+#   开关   = 带 IK_FK / FK_IK 自定义属性的骨（值 0~1）
+#   控制器 = 同侧别、同部位词、名字里带 _fk / _ik 标记的骨（剔除 MCH/ORG/DEF）
+#
+# 这么认出来的肢体没有原生 snap，走自算快照（几何收敛到毫米级），和「脚本
+# 自动运行被关掉」时是同一条路 —— 精度略低但姿势不会弹回 rest。
+
+_IKFK_SWITCH_PROP_RE = re.compile(r"^(ik[_-]?fk|fk[_-]?ik)([_-]?(switch|mode|value))?$", re.I)
+_FK_MARK_RE = re.compile(r"[._-]fk(?=[._-]|$)", re.I)
+_IK_MARK_RE = re.compile(r"[._-]ik(?=[._-]|$)", re.I)
+_INTERNAL_BONE_RE = re.compile(r"^(MCH|ORG|DEF|VIS|WGT)[-_]", re.I)
+
+
+def _switch_props(rig):
+    """骨架里所有像「IK/FK 开关」的自定义属性：[(骨名, 属性名)]。"""
+    out = []
+    for pb in rig.pose.bones:
+        for key in pb.keys():
+            if key == "_RNA_UI" or not isinstance(key, str):
+                continue
+            if not _IKFK_SWITCH_PROP_RE.match(key):
+                continue
+            try:
+                v = float(pb[key])
+            except Exception:
+                continue
+            if -0.001 <= v <= 1.001:
+                out.append((pb.name, key))
+                break
+    return out
+
+
+def _looks_rigify(rig):
+    if rig.data.get("rig_id"):
+        return True
+    for b in rig.data.bones:
+        if b.name.upper().startswith("ORG-"):
+            return True
+    return False
+
+
+def _limbs_rigify_struct(rig):
+    out = []
+    for bone_name, prop in _switch_props(rig):
+        side = _limb_side(bone_name)
+        words = _limb_words(bone_name)
+        if side is None or words is None:
+            continue          # 侧别/部位认不出来就不猜，免得把两条腿混成一条
+        ik, fk = [], []
+        for pb in rig.pose.bones:
+            n = pb.name
+            if _INTERNAL_BONE_RE.match(n) or _bone_side(n) != side:
+                continue
+            low = n.lower()
+            if not any(w in low for w in words):
+                continue
+            if _FK_MARK_RE.search(low):
+                fk.append(n)
+            elif _IK_MARK_RE.search(low) or "pole" in low:
+                ik.append(n)
+        fk = sorted(dict.fromkeys(fk), key=lambda n: _depth_of(rig, n))
+        ik = sorted(dict.fromkeys(ik), key=lambda n: _depth_of(rig, n))
+        if len(fk) < 2 or not ik:
+            continue
+        lb = CN_Limb()
+        col = next(iter(rig.pose.bones[bone_name].bone.collections), None)
+        lb.label = col.name if col is not None else bone_name
+        lb.prop_bone = bone_name
+        lb.prop_name = prop
+        # FK_IK：1 = IK；IK_FK：1 = FK —— 属性名就能定语义，不用猜 0.5
+        if prop.lower().replace("_", "").replace("-", "").startswith("fkik"):
+            lb.fk_value, lb.ik_value = 0.0, 1.0
+        else:
+            lb.fk_value, lb.ik_value = 1.0, 0.0
+        lb.fk_controls = fk
+        lb.ik_controls = ik
+        out.append(lb)
     return out
 
 
@@ -7392,6 +9967,307 @@ def _limbs_animate(rig):
     return out
 
 
+# ---- 游戏系自定义绑定（Anby / SAnby_Rigui 这类）----
+#
+# 不是 Rigify 标准骨名，也不是 c_ 前缀：开关属性叫 `Arm_IK-FK.L`、
+# `Leg_IK_FK.R`，挂在 PROPERTIES 这种属性骨上；snap 按钮是绑定作者自己
+# 写的（`sanby_rig.ik_fk_arm`，带 side 参数、自带矩阵吸附）。上面三条路
+# 都认不出。这里做两件事：
+#   1. 找「像开关」的属性：ik 在前 fk 在后，可带部位前缀和 .L/.R 后缀；
+#   2. 从 rig_ui 文本里找自家的 snap 按钮（bl_idname 含 ik_fk / fk_ik），
+#      注册成功的归到对应肢体 —— 语义由按钮源码背书（ik_fk_* 把开关写成
+#      1.0 = FK，fk_ik_* 写 0.0 = IK），有原生 snap 用原生的，没有就自算。
+
+_CUSTOM_SWITCH_PROP_RE = re.compile(
+    r"^[a-z0-9_\-]*ik[-_]?fk(?:[._-](?:l|r))?$", re.I)
+_UI_SNAP_IDNAME_RE = re.compile(
+    r"""bl_idname\s*=\s*["']([a-z0-9_]+)\.((?:ik[_-]?fk|fk[_-]?ik)[a-z0-9_]*)["']""",
+    re.I)
+# FK/IK 标记：前缀（FK_Upperarm.L）和中缀（upper_arm_fk.L）都认
+_FK_TAG_RE = re.compile(r"(?:^|[._-])fk(?:[._-]|$)", re.I)
+_IK_TAG_RE = re.compile(r"(?:^|[._-])ik(?:[._-]|$)", re.I)
+
+
+def _limb_word_of(text):
+    """从属性名 / 按钮名里认部位词：arm / leg，认不出返回 None。"""
+    low = (text or "").lower()
+    for w in _ARM_WORDS:
+        if w in low:
+            return "arm"
+    for w in _LEG_WORDS:
+        if w in low:
+            return "leg"
+    return None
+
+
+def _custom_snap_ops(rig):
+    """扫 rig_ui 文本，找自家 snap 按钮：{部位: {'fk': (op_id, 有side), 'ik': …}}。
+
+    只认**注册成功**的操作符 —— 文本还在、类没跑起来的烂摊子不碰。
+    """
+    out = {}
+    for txt in bpy.data.texts:
+        try:
+            s = txt.as_string()
+        except Exception:
+            continue
+        if not s or len(s) > 4_000_000:
+            continue
+        if ("ik_fk" not in s and "fk_ik" not in s
+                and "IK_FK" not in s and "FK_IK" not in s):
+            continue
+        for m in _UI_SNAP_IDNAME_RE.finditer(s):
+            mod, name = m.group(1), m.group(2)
+            low = name.lower()
+            # ik_fk_* = 切到 FK（源码里把开关写成 1.0）；fk_ik_* = 切到 IK
+            direction = "fk" if low.startswith("ik") else "ik"
+            limb = _limb_word_of(low)
+            if limb is None:
+                continue
+            mod_obj = None
+            try:
+                mod_obj = getattr(bpy.ops, mod, None)
+                fn = getattr(mod_obj, name, None) if mod_obj is not None \
+                    else None
+                if fn is None:
+                    continue
+                rna = fn.get_rna_type()
+            except Exception:
+                continue
+            names = set(p.identifier for p in rna.properties)
+            entry = out.setdefault(limb, {})
+            if direction not in entry:
+                entry[direction] = (mod + "." + name, "side" in names)
+    return out
+
+
+# ---- 开关属性到底哪一端是 IK（不能信按钮上的字）----------------------
+#
+# 用户报障（Anby）：模型明明是 FK 态，插件判成 IK，按「→ FK」反而切回 IK。
+# 实测（移动 IK_Hand.L / FK_Hand.L 看 ORG-Hand.L 跟不跟）：
+#   Arm_IK-FK.L = 0.0 → FK 驱动；= 1.0 → IK 驱动。
+# 而作者按钮 `sanby_rig.ik_fk_arm`（写着 IK > FK）写的是 1.000 —— 也就是
+# 按钮文字和实际语义正好相反（这颗按钮自己按下去才是不生效的那颗）。
+# 所以端值只能从**驱动器**读：找被这个属性驱动的约束，看它 COPY 的来源骨
+# 是 IK 骨还是 FK 骨，再按表达式算属性 0/1 时它的影响值，影响大的那一端
+# 就是这套控制器真正干活的那一端。
+
+_CONS_INF_SV_RE = re.compile(
+    r'pose\.bones\["([^"]+)"\]\.constraints\["([^"]+)"\]\.influence$')
+
+
+def _expr_at(expr, varnames, v):
+    """把驱动器表达式按「变量=v」算个数值。只认四则运算，其它一律放弃。"""
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except Exception:
+        return None
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant):
+            return float(node.value)
+        if isinstance(node, ast.Name):
+            return float(varnames.get(node.id, v))
+        if isinstance(node, ast.UnaryOp):
+            val = ev(node.operand)
+            return -val if isinstance(node.op, ast.USub) else val
+        if isinstance(node, ast.BinOp):
+            a, b = ev(node.left), ev(node.right)
+            if isinstance(node.op, ast.Add):
+                return a + b
+            if isinstance(node.op, ast.Sub):
+                return a - b
+            if isinstance(node.op, ast.Mult):
+                return a * b
+            if isinstance(node.op, ast.Div):
+                return a / b if b else None
+        raise ValueError("unsupported")
+
+    try:
+        return ev(tree)
+    except Exception:
+        return None
+
+
+def _cons_source_tag(c):
+    """约束「照着」的那根骨是 IK 还是 FK（Copy Transforms / Child Of / Armature）。"""
+    names = []
+    try:
+        if getattr(c, "subtarget", ""):
+            names.append(c.subtarget)
+    except Exception:
+        pass
+    for t in getattr(c, "targets", []) or []:
+        try:
+            if t.subtarget:
+                names.append(t.subtarget)
+        except Exception:
+            pass
+    for n in names:
+        low = n.lower()
+        if "ik_fk" in low or "fk_ik" in low:
+            continue
+        if _FK_TAG_RE.search(low):
+            return "FK"
+        if _IK_TAG_RE.search(low) or "pole" in low:
+            return "IK"
+    return ""
+
+
+def _switch_values(rig, prop_bone, prop_name):
+    """返回 (fk_value, ik_value)；读不出来返回 None。"""
+    ad = getattr(rig, "animation_data", None)
+    if ad is None:
+        return None
+    want = 'pose.bones["%s"]["%s"]' % (prop_bone, prop_name)
+    tally = {}
+    for d in ad.drivers:
+        vars_ = list(d.driver.variables or [])
+        hit = False
+        for var in vars_:
+            for t in (var.targets or []):
+                if t.id == rig and t.data_path == want:
+                    hit = True
+        if not hit:
+            continue
+        m = _CONS_INF_SV_RE.match(d.data_path or "")
+        if not m:
+            continue
+        pb = rig.pose.bones.get(m.group(1))
+        if pb is None:
+            continue
+        c = pb.constraints.get(m.group(2))
+        if c is None:
+            continue
+        tag = _cons_source_tag(c)
+        if not tag:
+            continue
+        names = dict((var.name, 0.0) for var in vars_)
+        i0 = _expr_at(d.driver.expression, names, 0.0)
+        names1 = dict((var.name, 1.0) for var in vars_)
+        i1 = _expr_at(d.driver.expression, names1, 1.0)
+        if i0 is None or i1 is None or abs(i1 - i0) < 1e-6:
+            continue
+        live = 1.0 if i1 > i0 else 0.0
+        tally.setdefault(tag, []).append(live)
+    if "IK" not in tally and "FK" not in tally:
+        return None
+    if "IK" in tally:
+        ik = max(set(tally["IK"]), key=tally["IK"].count)
+        return (0.0 if ik else 1.0), ik
+    fk = max(set(tally["FK"]), key=tally["FK"].count)
+    return fk, (0.0 if fk else 1.0)
+
+
+def _driven_switch_props(rig):
+    """被任何驱动器引用过的自定义开关属性集合 {(骨名, 属性名)}。
+
+    整根骨架没有任何驱动器时返回 None（调用方据此跳过过滤）——
+    驱动器引用格式是 pose.bones["PROPERTIES"]["Leg_IK_FK.R"] 这类
+    data_path，出现在驱动器变量的目标上。Object 和 Armature 两份
+    animation_data 都扫（约束驱动器挂在 Object 上，个别挂 data 上）。
+    """
+    out = set()
+    total = 0
+    for ad in (getattr(rig, "animation_data", None),
+               getattr(rig.data, "animation_data", None)):
+        if not ad:
+            continue
+        try:
+            drivers = ad.drivers
+        except Exception:
+            continue
+        for d in drivers:
+            total += 1
+            for v in d.driver.variables:
+                for t in v.targets:
+                    dp = t.data_path or ""
+                    m = re.search(r'pose\.bones\["([^"]+)"\]\["([^"]+)"\]', dp)
+                    if m:
+                        out.add((m.group(1), m.group(2)))
+    if not total:
+        return None
+    return out
+
+
+def _limbs_custom_ui(rig):
+    """从开关属性 + 自家 snap 按钮认肢体。认不出控制器的属性直接跳过。"""
+    props = []
+    for pb in rig.pose.bones:
+        for key in pb.keys():
+            if key == "_RNA_UI" or not isinstance(key, str):
+                continue
+            if not _CUSTOM_SWITCH_PROP_RE.match(key):
+                continue
+            try:
+                v = float(pb[key])
+            except Exception:
+                continue
+            if -0.001 <= v <= 1.001:
+                props.append((pb.name, key))
+    if not props:
+        return []
+    # v5.2.24：驱动器零引用的开关属性是**死开关**，直接丢弃。
+    #   Ju_Fufu 实测：PROPERTIES 上同时挂着 Leg_IK_FK.R（下划线，驱动
+    #   MCH-SWI-Thigh/Calf/Foot 切换链，真开关）和 Leg_IK-FK.R（连字符，
+    #   作者改名后的残留，零驱动器引用）——两根都认出来就是 5 行肢体，
+    #   右腿出现两个长得一样的开关，用户「摸不着头脑」。
+    #   判据沿用 v5.2.13 的哲学：只信驱动器。整根骨架一个驱动器都没有
+    #   的极端情况不过滤（机制可能不走驱动器，宁可信其有）。
+    driven = _driven_switch_props(rig)
+    snap_ops = _custom_snap_ops(rig)
+    out = []
+    for prop_bone, prop in props:
+        if driven is not None and (prop_bone, prop) not in driven:
+            continue          # 没有任何驱动器引用它 —— 废属性
+        side = _limb_side(prop) or _limb_side(prop_bone)
+        limb = _limb_word_of(prop) or _limb_word_of(prop_bone)
+        if side is None or limb is None:
+            continue          # 侧别 / 部位认不出来就不猜
+        words = _ARM_WORDS if limb == "arm" else _LEG_WORDS
+        fk, ik = [], []
+        for pb in rig.pose.bones:
+            n = pb.name
+            if _INTERNAL_BONE_RE.match(n) or _bone_side(n) != side:
+                continue
+            low = n.lower()
+            if "ik_fk" in low or "fk_ik" in low:
+                continue      # 混合机制骨（FK-IK_Hand 这类），不算控制器
+            if not any(w in low for w in words):
+                continue
+            if _FK_TAG_RE.search(low):
+                fk.append(n)
+            elif _IK_TAG_RE.search(low) or "pole" in low:
+                ik.append(n)
+        fk = sorted(dict.fromkeys(fk), key=lambda n: _depth_of(rig, n))
+        ik = sorted(dict.fromkeys(ik), key=lambda n: _depth_of(rig, n))
+        if len(fk) < 2 or not ik:
+            continue
+        lb = CN_Limb()
+        lb.label = prop
+        lb.prop_bone = prop_bone
+        lb.prop_name = prop
+        # 端值从驱动器实测（见 _switch_values）。Anby 的 Arm_IK-FK.L 是
+        # 0 = FK / 1 = IK，跟作者按钮上写反了 —— 不能拿按钮文字当语义。
+        vals = _switch_values(rig, prop_bone, prop)
+        lb.fk_value, lb.ik_value = vals if vals else (1.0, 0.0)
+        lb.fk_controls = fk
+        lb.ik_controls = ik
+        snap = snap_ops.get(limb) or {}
+        if "fk" in snap:
+            op_id, has_side = snap["fk"]
+            lb.rigify_to_fk = (op_id, {"side": side.upper()} if has_side
+                               else {})
+        if "ik" in snap:
+            op_id, has_side = snap["ik"]
+            lb.rigify_to_ik = (op_id, {"side": side.upper()} if has_side
+                               else {})
+        out.append(lb)
+    return out
+
+
 # ---- 统一入口
 
 def _ikfk_sig(rig):
@@ -7416,6 +10292,20 @@ def ikfk_limbs(rig):
             kind = "rigify"
     except Exception:
         limbs = []
+    # 有 rig_ui 文本的肢体优先（能走原生 snap）；文本里没写到的肢体
+    # （创作者自己加的、或者 UI 被删掉一半的）再按结构补一遍。
+    try:
+        if kind == "rigify":
+            have = set(lb.prop_bone for lb in limbs)
+            for lb in _limbs_rigify_struct(rig):
+                if lb.prop_bone not in have:
+                    limbs.append(lb)
+        elif _looks_rigify(rig):
+            limbs = _limbs_rigify_struct(rig)
+            if limbs:
+                kind = "rigify"
+    except Exception:
+        pass
     if not limbs:
         try:
             limbs = _limbs_animate(rig)
@@ -7423,12 +10313,36 @@ def ikfk_limbs(rig):
                 kind = "animate"
         except Exception:
             limbs = []
+    # 游戏系自定义绑定（开关属性挂 PROPERTIES 骨、snap 按钮是作者自己写
+    # 的）：标准 Rigify / 结构兜底都认不出的属性，在这里补上。已认出的
+    # （prop_bone, prop_name）不重复加。
+    try:
+        have = set((lb.prop_bone, lb.prop_name) for lb in limbs)
+        for lb in _limbs_custom_ui(rig):
+            if (lb.prop_bone, lb.prop_name) not in have:
+                limbs.append(lb)
+                if not kind:
+                    kind = "custom"
+    except Exception:
+        pass
+    # 端值统一按驱动器实测校正：各绑定的开关语义完全自由（Rigify 的
+    # IK_FK 是 1=FK，Anby 的 Arm_IK-FK.L 反过来是 1=IK，手指的 FK_IK 又是
+    # 1=IK）。只要能从驱动器读出来，就以驱动器为准 —— 读不出来才用默认值。
+    for lb in limbs:
+        vals = _switch_values(rig, lb.prop_bone, lb.prop_name)
+        if vals:
+            lb.fk_value, lb.ik_value = vals
     if sig is not None:
         _IKFK_CACHE[sig] = (kind, limbs)
     return kind, limbs
 
 
 def limb_mode(rig, lb):
+    """当前是 IK 还是 FK —— 按这个肢体自己的两个端点值比，不写死 0.5。
+
+    Rigify 的肢体用 `IK_FK`（1 = FK），手指用 `FK_IK`（1 = IK），
+    两者语义正好相反，拿 0.5 硬比会把手指永远判成 IK。
+    """
     pb = rig.pose.bones.get(lb.prop_bone)
     if pb is None or lb.prop_name not in pb:
         return None
@@ -7436,7 +10350,46 @@ def limb_mode(rig, lb):
         v = float(pb[lb.prop_name])
     except Exception:
         return None
-    return "FK" if v >= 0.5 else "IK"
+    fk_v = float(getattr(lb, "fk_value", 1.0))
+    ik_v = float(getattr(lb, "ik_value", 0.0))
+    if abs(v - fk_v) <= abs(v - ik_v):
+        return "FK"
+    return "IK"
+
+
+def _op_prop_kwargs(op_id, props):
+    """按操作符真实的属性类型摆参数。
+
+    rig_ui.py 里 `props.fk_chain = '["a","b"]'` 是一段**字符串字面量**，
+    ast.literal_eval 会把它变成 Python list；直接喂给 StringProperty 会
+    TypeError，snap 就悄悄失败了（表现出来就是「一切换姿势就弹回 rest」）。
+    这里查一次操作符的 RNA，字符串属性收到 list 就转回 JSON 文本。
+    """
+    out = {}
+    if not props:
+        return out
+    spec = {}
+    try:
+        mod, _, name = op_id.partition(".")
+        if "." in op_id and mod != "pose":
+            fn = getattr(getattr(bpy.ops, mod), name)
+        else:
+            fn = getattr(bpy.ops.pose, name)
+        rna = fn.get_rna_type()
+        spec = dict((p.identifier, p.type) for p in rna.properties)
+    except Exception:
+        spec = {}
+    for k, v in props.items():
+        want = spec.get(k)
+        if want == 'STRING' and isinstance(v, (list, tuple)):
+            out[k] = json.dumps([str(x) for x in v])
+        elif want == 'BOOLEAN' and isinstance(v, (list, tuple)):
+            out[k] = tuple(bool(x) for x in v)
+        elif want == 'FLOAT' and isinstance(v, (list, tuple)):
+            out[k] = tuple(float(x) for x in v)
+        else:
+            out[k] = v
+    return out
 
 
 def _snap_by_matrix(rig, pairs):
@@ -7458,27 +10411,927 @@ def _snap_by_matrix(rig, pairs):
     return done
 
 
-def ikfk_sync_visibility(rig, lb, target):
-    """切完只留当前那套控制器，另一套逐根藏起来。
+_DEF_STRIP_FK_RE = re.compile(r"[._]fk(?=[._]|$)", re.I)
+_DEF_STRIP_IK_RE = re.compile(r"[._]ik(?=[._]|$)", re.I)
+# 主 IK 目标挂在末端（Rigify 的 thigh_ik / Hip_ik 在脚底），名字里的
+# 关节词是「这条链从哪根开始」，不是「目标点在哪根」，不能按名字配。
+_PROXIMAL_IK_RE = re.compile(
+    r"(thigh|hip|upper_arm|upperarm|shoulder|clavicle|shin|knee)", re.I)
 
-    不能按集合藏：IK 和 FK 控制器就躺在同一个集合里（"左臂"里两者都有）。
+
+def _deform_pool(rig):
+    """配对候选骨：ORG 优先，其次 DEF。
+
+    Rigify 里 FK 控制器和 IK 目标都是照 **ORG** 骨（原始关节）做的，
+    DEF 是蒙皮骨，带着扭转分布（upper_arm 的 DEF 会把扭转折到手臂上）。
+    拿 DEF 去对 FK 控制器，手会偏 10 cm —— 这是 v5.2 实测踩到的。
+    """
+    orgs = [b.name for b in rig.data.bones
+            if b.name.upper().startswith("ORG")]
+    defs = [b.name for b in rig.data.bones
+            if b.name.upper().startswith("DEF")]
+    if orgs or defs:
+        return orgs + defs
+    # 没有 ORG/DEF 前缀的绑定（Auto-Rig Pro 系）：退回蒙皮骨，同样剔机制骨
+    pool = _skin_bone_names(rig)
+    return pool or [b.name for b in rig.data.bones]
+
+
+def _deform_of(rig, ctrl, strip_re):
+    base = strip_re.sub("", ctrl or "")
+    for cand in ("ORG-" + base, "ORG_" + base,
+                 "DEF-" + base, "DEF_" + base, base):
+        # 不能把控制器自己当变形骨：`f_index.01_master.L` 剥不掉后缀时
+        # base 就是自己，配成 (自己, 自己) 等于什么都没做还返回「成功」。
+        if cand and cand != ctrl and rig.pose.bones.get(cand) is not None:
+            return cand
+    return None
+
+
+def _nearest_deform_head(rig, ctrl, pool, limit=0.08):
+    """rest 头部位置最近的变形骨。"""
+    pb = rig.pose.bones.get(ctrl)
+    if pb is None or not pool:
+        return None
+    ref = pb.bone.head_local
+    best, bestd = None, None
+    for n in pool:
+        b = rig.data.bones.get(n)
+        if b is None:
+            continue
+        d = (b.head_local - ref).length
+        if bestd is None or d < bestd:
+            best, bestd = n, d
+    return best if bestd is not None and bestd <= limit else None
+
+
+def _limb_pole_angle(rig, lb):
+    """这根肢体 IK 约束上的 pole_angle（Blender 对 pole 向量的角度偏置）。
+
+    Rigify 的腿是 -90°。不把这个角算进去，pole 摆的方向会整体差 90°，
+    解出来的膝盖偏离原位两三厘米、转 20° —— 看着就是「切完膝盖扭一下」。
+    """
+    pool = set(lb.ik_controls) | set(lb.fk_controls)
+    for pb in rig.pose.bones:
+        for c in pb.constraints:
+            if c.type != 'IK':
+                continue
+            if (c.pole_subtarget and c.pole_subtarget in pool) or \
+                    (c.subtarget and c.subtarget in pool):
+                try:
+                    return float(c.pole_angle)
+                except Exception:
+                    return 0.0
+    return 0.0
+
+
+def _pole_targets(rig, lb):
+    """真正挂在 IK 约束 `pole_subtarget` 上的骨骼名。
+
+    v5.2.1 的判据是「名字里带 target 或 pole 就挪」。Dialyn-琉音 实测：
+    手臂的 `upper_arm_ik_target.L` 名字里确实有 target，可它是**IK 目标本身**
+    （MCH-upper_arm_ik_target 的父级、约束的 pole_subtarget 都指向它），
+    一挪就是 223.7 mm；腿的 `thigh_ik_target.L` 更狠，840.2 mm。
+    挪完之后无论走原生 snap 还是自算快照，读到的都是「已经被挪坏的 IK 状态」，
+    于是 14 根肢体全部被判「切不过去」。现在只认约束上真实的 pole_subtarget，
+    名字一概不信。
+    """
+    pool = set(lb.ik_controls) | set(lb.fk_controls)
+    out = []
+    for pb in rig.pose.bones:
+        for c in pb.constraints:
+            if c.type != 'IK' or not c.pole_subtarget:
+                continue
+            n = c.pole_subtarget
+            if (n in pool and n not in out
+                    and rig.pose.bones.get(n) is not None):
+                out.append(n)
+    return out
+
+
+def _snap_pole(rig, lb):
+    """把 pole 摆到「当前膝盖（手肘）弯向的那一侧」，**保持它到链根的半径**。
+
+    v5.2.3：两处改动。
+      1. 只碰 `_pole_targets()` 认出来的真 pole，不再按名字猜。
+      2. 半径必须保住：原实现把 pole 摆到「肘 + 方向 × 上臂长」，那是按上臂
+         长度硬算的；Rigify 系手臂的 pole 本来就在离身体很远的地方
+         （rest 时 y=0.39 m），改半径等于把肘平面整个转过去。
+    最后按约束的 pole_angle 反向旋转一次，抵消 Blender 对 pole 向量的偏置。
+    """
+    names = lb.fk_controls[:3]
+    if len(names) < 3:
+        return 0
+    a, b, c = [rig.pose.bones.get(n) for n in names]
+    if a is None or b is None or c is None:
+        return 0
+    pa, pm, pc = a.head.copy(), b.head.copy(), c.head.copy()
+    axis = pc - pa
+    if axis.length < 1e-6:
+        return 0
+    an = axis.normalized()
+    proj = pa + an * (pm - pa).dot(an)
+    v = pm - proj
+    if v.length < 1e-4:
+        return 0              # 完全伸直：没有弯曲方向，pole 保持原样
+    dirv = v.normalized()
+    ang = _limb_pole_angle(rig, lb)
+    if abs(ang) > 1e-4:
+        try:
+            dirv = Matrix.Rotation(ang, 4, an) @ dirv
+        except Exception:
+            pass
+    done = 0
+    for pn in _pole_targets(rig, lb):
+        p = rig.pose.bones.get(pn)
+        if p is None:
+            continue
+        cur = p.matrix.translation.copy()
+        rad = (cur - pa).length
+        if rad < 1e-5:
+            rad = (pm - pa).length
+        m = p.matrix.copy()
+        m.translation = pa + dirv * rad
+        p.matrix = m
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+        done += 1
+    return done
+
+
+def _pole_optimize(rig, lb, plan, want):
+    """翻完开关后再决定要不要动 pole —— 只有真的把中段误差压小才留。
+
+    做法：记下原状，绕「链根→末端」轴把 pole 转 7 个方向，量肘/膝到目标的
+    距离；最好的那个要明显优于原状（< 98%）才采用，否则整根还原。
+
+    Dialyn-琉音 实测：同一个 MCH 上叠了两条 chain_count=2 的 IK 约束，pole
+    基本不起作用 —— 转满 360° 误差只在 21.9~22.0 mm 之间徘徊。这种时候
+    原地不动就是最优解；v5.2.1 在翻开关前盲挪 22 cm，把整条手臂甩飞。
+    """
+    if not plan:
+        return False
+    poles = [n for n in (plan.get("poles") or []) if rig.pose.bones.get(n)]
+    if not poles:
+        return False
+    root_n, mid_n, end_n = (plan.get("root_def"), plan.get("mid_def"),
+                            plan.get("end_def"))
+    rd, md, ed = (rig.pose.bones.get(root_n or ""),
+                  rig.pose.bones.get(mid_n or ""),
+                  rig.pose.bones.get(end_n or ""))
+    if rd is None or md is None or ed is None or want.get(mid_n) is None:
+        return False
+    base = {n: rig.pose.bones[n].matrix.copy() for n in poles}
+    root = rd.matrix.translation.copy()
+    goal = ed.matrix.translation.copy()
+    axis = goal - root
+    if axis.length < 1e-6:
+        return False
+    an = axis.normalized()
+    offs = {n: base[n].translation - root for n in poles}
+    base_err = (md.matrix.translation - want[mid_n]).length
+    best_err, best_mats = base_err, None
+    for k in range(1, 8):
+        rot = Matrix.Rotation(math.radians(45.0 * k), 4, an)
+        cand = {}
+        for n in poles:
+            m = base[n].copy()
+            m.translation = root + (rot @ offs[n])
+            rig.pose.bones[n].matrix = m
+            cand[n] = m
+        _flush_rig(rig)
+        d = (md.matrix.translation - want[mid_n]).length
+        if d < best_err:
+            best_err, best_mats = d, cand
+    if best_mats is None or best_err >= base_err * 0.98:
+        for n in poles:
+            rig.pose.bones[n].matrix = base[n]
+        _flush_rig(rig)
+        return False
+    for n in poles:
+        rig.pose.bones[n].matrix = best_mats[n]
+    _flush_rig(rig)
+    return True
+
+
+def _snap_generic(rig, lb, target):
+    """Rigify 原生 snap 用不了时的自算快照：宁可慢一点，也不许姿势弹回 rest。"""
+    pool = _deform_pool(rig)
+    pairs = []
+    if target == "FK":
+        for c in lb.fk_controls:
+            d = _deform_of(rig, c, _DEF_STRIP_FK_RE)
+            if d is None and pool:
+                d = _nearest_deform_head(rig, c, pool)
+            if d:
+                pairs.append((c, d))
+        return _snap_by_matrix(rig, pairs) > 0
+    for c in lb.ik_controls:
+        low = c.lower()
+        if "target" in low or "pole" in low:
+            continue
+        if _PROXIMAL_IK_RE.search(c):
+            d = _nearest_deform_head(rig, c, pool) if pool else None
+        else:
+            d = _deform_of(rig, c, _DEF_STRIP_IK_RE)
+            if d is None and pool:
+                d = _nearest_deform_head(rig, c, pool)
+        if d is None:
+            continue
+        pairs.append((c, d))
+    n = _snap_by_matrix(rig, pairs)
+    _snap_pole(rig, lb)
+    return n > 0
+
+
+def _snap_generic_or_refuse(rig, lb, target):
+    """手指那套（链骨 f_index.01/.02/.03）没有和变形骨一一对应的关系，
+    自算兜底保不住姿势 —— 宁可拒绝切换，也不许把手指拍到 rest 上。"""
+    if getattr(lb, "is_finger", False):
+        return False
+    return _snap_generic(rig, lb, target)
+
+
+def _set_bone_hidden(rig, name, hidden):
+    """藏/显一根骨：`Bone.hide` 和 `PoseBone.hide` 两个都要动。
+
+    不同绑定的藏法不一样 —— Rigify 系走 `Bone.hide`，而 RIG-Klukai 这类
+    自带 UI 脚本的绑定走 `PoseBone.hide`。只改前者的话，切完 FK 骨头还是
+    藏着的，导航列表里只剩 `Hip_parent_L` 那个属性骨（用户报的第一根问题）。
+    """
+    b = rig.data.bones.get(name)
+    if b is not None:
+        try:
+            b.hide = hidden
+        except Exception:
+            pass
+    pb = rig.pose.bones.get(name)
+    if pb is not None:
+        try:
+            pb.hide = hidden
+        except Exception:
+            pass
+
+
+def _col_tag(name):
+    """集合名里的 IK / FK 标记：`IK_Arm.L`、`Arm.L (IK)`、`Leg_IK_FK.L`。"""
+    toks = [t.lower() for t in re.split(r"[^0-9A-Za-z]+", name or "") if t]
+    if "ik" in toks:
+        return "IK"
+    if "fk" in toks:
+        return "FK"
+    return ""
+
+
+def _bone_cols(pb):
+    try:
+        return list(pb.bone.collections)
+    except Exception:
+        return []
+
+
+def _col_visible(col):
+    v = getattr(col, "is_visible", None)
+    return True if v is None else bool(v)
+
+
+def _col_set_visible(col, visible):
+    """单个集合显/隐；要显的时候把祖先链一起打开（父集合关着，开子集合没用）。"""
+    if visible:
+        chain, c, guard = [], col, 0
+        while c is not None and guard < 16:
+            chain.append(c)
+            c = getattr(c, "parent", None)
+            guard += 1
+        for c in reversed(chain):
+            if not _col_visible(c):
+                try:
+                    c.is_visible = True
+                except Exception:
+                    pass
+    elif _col_visible(col):
+        try:
+            col.is_visible = False
+        except Exception:
+            pass
+
+
+def _vis_twin(rig, name):
+    """`IK_Arm_Pole.L` 有没有 `VIS-IK_Arm_Pole.L` 这种「显示替身」。
+
+    有替身的骨是刻意的机制骨：真正抓的那个控件是 VIS 骨，自己藏着才对。
+    """
+    for pre in ("VIS-", "VIS_", "vis-"):
+        if rig.pose.bones.get(pre + name) is not None:
+            return True
+    return False
+
+
+def ikfk_sync_visibility(rig, lb, target):
+    """切完只留当前那套控制器：**优先按骨骼集合切**，切不了才逐根藏。
+
+    v5.2.12 重写。用户报「另一套还留着 / 该出的没出」，根因是这里只写了
+    `bone.hide`：Anby 这类绑定把两套控制器分装进 `IK_Arm.L` / `FK_Arm.L`
+    集合（Rigify 是 `Arm.L (IK)` / `Arm.L (FK)`），真正让控制器出现在视图
+    里的是**集合可见性**。逐根 hide 只能藏掉自己那份，集合里的其他成员
+    （`VIS-…` 假骨、`Elbow_Pin`、`IK_Palm`、`Arm_Parent`）照样挂在视图里
+    ——「另一套还留着」；反过来，目标那套的集合若关着，把 hide 清掉也什么
+    都看不见 ——「该出的没出」（Anby 的 `IK_Arm.L` 存盘时就是关着的）。
+    所以：两侧都有名字带 IK/FK 的集合 → 关一套开一套；没有配对集合
+    （控制器都堆在同一个集合里）→ 退回逐根 hide。
     """
     if not pref("sync_collections", True):
         return
-    keep = lb.fk_controls if target == "FK" else lb.ik_controls
-    drop = lb.ik_controls if target == "FK" else lb.fk_controls
+    want = "FK" if target == "FK" else "IK"
+    other = "IK" if want == "FK" else "FK"
+    keep = list(lb.fk_controls if want == "FK" else lb.ik_controls)
+    drop = list(lb.ik_controls if want == "FK" else lb.fk_controls)
+    keep_cols, drop_cols = {}, {}
+    for names, tag, bucket in ((keep, want, keep_cols), (drop, other, drop_cols)):
+        for n in names:
+            pb = rig.pose.bones.get(n)
+            if pb is None:
+                continue
+            for c in _bone_cols(pb):
+                if _col_tag(c.name) == tag:
+                    bucket.setdefault(c.name, c)
+    if keep_cols or drop_cols:
+        for c in keep_cols.values():
+            _col_set_visible(c, True)
+        for c in drop_cols.values():
+            _col_set_visible(c, False)
+        # 集合开着、骨却是单根 H 过的（Anby 存盘状态正是如此）：清掉，
+        # 否则「该出的」还是差几根。带 VIS 替身的不动 —— 那是机制骨。
+        for n in keep:
+            pb = rig.pose.bones.get(n)
+            if pb is None or not pb.bone.hide:
+                continue
+            if _vis_twin(rig, n):
+                continue
+            if any(_col_tag(c.name) == want for c in _bone_cols(pb)):
+                _set_bone_hidden(rig, n, False)
+        return
     for n in drop:
-        b = rig.data.bones.get(n)
-        if b is not None:
-            b.hide = True
+        _set_bone_hidden(rig, n, True)
     for n in keep:
-        b = rig.data.bones.get(n)
-        if b is not None:
-            b.hide = False
+        _set_bone_hidden(rig, n, False)
+        # Rigify 的手指 IK 控制器住在一直关着的 `Fingers (Detail)` 里：
+        # 光清 hide 它还是不出现（实测 10 根手指全「该出的没出」）。
+        # 只在它一根可见集合都没有时才把集合打开，别去动别的。
+        pb = rig.pose.bones.get(n)
+        if pb is None:
+            continue
+        cols = _bone_cols(pb)
+        if not any(_col_visible(c) for c in cols):
+            for c in cols:
+                _col_set_visible(c, True)
+
+
+_POSE_DRIFT_LIMIT = 0.12      # 12 cm：到这程度才算"炸姿势"，宁可保持原模式
+_POSE_ANG_LIMIT = math.radians(15.0)   # 15°：脚掌被扭过去也算炸姿势
+# v5.2.3 的「照切但提示」档。Rigify 系骨架 FK→IK 的物理下限就是这个量级：
+# 手/脚能对到 0.0 mm，肘/膝受骨骼长度与 IK 求解器限制会差 2~4 cm。
+_ACCEPT_DRIFT = 0.06          # 6 cm：肢体自身最大位移
+_ACCEPT_ANG = math.radians(30.0)   # 30°：肢体自身最大转角
+
+
+def _flush_rig(rig):
+    try:
+        rig.update_tag()
+        bpy.context.view_layer.update()
+        bpy.context.evaluated_depsgraph_get().update()
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+
+
+def _pose_state(rig):
+    """整根骨架的矩阵快照（matrix_basis，不依赖约束求值顺序）。"""
+    out = []
+    for pb in rig.pose.bones:
+        try:
+            out.append((pb.name, pb.matrix_basis.copy()))
+        except Exception:
+            pass
+    return out
+
+
+def _pose_restore(rig, state):
+    for name, mb in state:
+        pb = rig.pose.bones.get(name)
+        if pb is not None:
+            try:
+                pb.matrix_basis = mb
+            except Exception:
+                pass
+    _flush_rig(rig)
+
+
+def _measured_bones(rig):
+    """量谁：DEF（蒙皮）+ ORG（原始关节）。
+
+    ORG 必须算进来 —— 几何收敛要靠它当「肩/肘/腕」三个关节的参照，
+    只量 DEF 的话手臂收起时偏差会被蒙皮骨夸大，收敛也没数据可用。
+
+    没有 DEF/ORG 前缀的绑定（Auto-Rig Pro 系：`rig` / `rig.001` 这类，
+    变形骨直接叫 `hand.l`）退回 `use_deform`，再退到全部骨骼 —— 否则
+    量测集是空的，`_skin_drift` 永远返回 0，炸姿势也会被判成「切成功」。
+    """
+    out = []
+    for b in rig.data.bones:
+        up = b.name.upper()
+        if up.startswith("DEF") or up.startswith("ORG"):
+            out.append(b.name)
+    if out:
+        return out
+    out = _skin_bone_names(rig)
+    return out or [b.name for b in rig.data.bones]
+
+
+# 没有 DEF/ORG 的绑定里，use_deform 会混进机制骨：ARP 把 stretch / twist /
+# bend 也标成变形骨，而 IK↔FK 一切换它们本来就该变长度、变朝向。
+# 拿它们当「不许动」的基准，能报出 61° 的假失败。
+_HELPER_BONE_RE = re.compile(
+    r"(^c_|^ctrl|^wgt|widget|stretch|twist|bend|pole|roll|follow"
+    r"|_ik([._]|$)|_fk([._]|$)|^mch|^org[-_.]|^def[-_.]"
+    r"|license|licence|watermark|水印)", re.I)
+# 肢体量测集里也要剔掉的补偿骨：拧转 / 拉伸 / 弯曲。IK 与 FK 对它们的
+# 驱动方式本来就不同，往返切一次能差几十度，但蒙皮位置一动不动。
+_TWIST_HELPER_RE = re.compile(r"(twist|stretch|bend)", re.I)
+
+
+def _skin_bone_names(rig):
+    """真正带动网格的骨：use_deform 里剔掉机制骨；剔完空了就退回原集合。"""
+    raw = [b.name for b in rig.data.bones if b.use_deform]
+    if not raw:
+        return []
+    clean = [n for n in raw if not _HELPER_BONE_RE.search(n)]
+    return clean or raw
+
+
+def _skin_positions(rig):
+    """切换前后要「不许动」的那批骨的头部位置。"""
+    out = {}
+    for name in _measured_bones(rig):
+        pb = rig.pose.bones.get(name)
+        if pb is not None:
+            out[name] = pb.matrix.translation.copy()
+    return out
+
+
+def _skin_drift(rig, before):
+    worst = 0.0
+    for n, pos in before.items():
+        pb = rig.pose.bones.get(n)
+        if pb is None:
+            continue
+        d = (pb.matrix.translation - pos).length
+        if d > worst:
+            worst = d
+    return worst
+
+
+def _skin_rot_drift(rig, before_q):
+    """旋转漂移（弧度）：只量位置会漏掉「脚掌被扭了 78°」这种。
+
+    RIG-Skins 的左脚就是：踝位置对得上，脚掌整体转过去 78°，
+    而位置量测显示 0 mm —— 于是被判成「切成功」。
+    """
+    worst = 0.0
+    for n, q in (before_q or {}).items():
+        pb = rig.pose.bones.get(n)
+        if pb is None:
+            continue
+        try:
+            ang = pb.matrix.to_quaternion().rotation_difference(q).angle
+        except Exception:
+            continue
+        ang = min(ang, 2.0 * math.pi - ang)
+        if ang > worst:
+            worst = ang
+    return worst
+
+
+def _finger_chain(lb):
+    """手指的 FK 链骨名（`f_index.01.L` / `.02` / `.03`）。
+
+    不能直接用 lb.fk_controls：Rigify 的手指只把它那个 master 控制骨算进
+    fk_controls，真正带变形骨的是链上三节，名字藏在原生按钮的 props 里
+    （fk_chain / output_bones）。这里把两处都捞一遍。
+    """
+    out = []
+    for call in (lb.rigify_to_ik, lb.rigify_to_fk):
+        if not call:
+            continue
+        props = call[1] or {}
+        for key in ("fk_chain", "output_bones", "fk_bones"):
+            for n in _as_names(props.get(key)):
+                if n not in out:
+                    out.append(n)
+    return out
+
+
+def _finger_calc(rig, lb, target):
+    """手指的兜底快照（只在骨架原生 snap 不可用时走这条）。
+
+    手指的原生按钮（`rigify_finger_fk2ik` / `generic_snap`）要靠文件里
+    「自动运行脚本」开着才会注册。关着的时候 bpy.ops 里根本没有这两个
+    算子，v5.2.1 于是直接拒绝切换 —— 手指永远停在原模式。
+    这里退回按矩阵对齐：IK 方向把 `f_xxx.01_ik` 摆到 FK 末节（指尖）的位置，
+    FK 方向按各节变形骨把 FK 链摆回去。精度不如原生（原生会连 roll 一起算），
+    但姿势不会弹回 rest。
+    """
+    if not lb.ik_controls:
+        return False
+    chain = [n for n in _finger_chain(lb) if rig.pose.bones.get(n)]
+    if not chain:
+        return False
+    if target == "FK":
+        pairs = []
+        for c in chain:
+            d = _deform_of(rig, c, _DEF_STRIP_FK_RE)
+            if d:
+                pairs.append((c, d))
+        return _snap_by_matrix(rig, pairs) > 0
+    # 从末端往前找第一节能对上变形骨的 —— fk_chain 末尾常带
+    # `f_index.01.L.001` 这种辅助骨，它没有对应的 ORG，直接取 [-1] 会配对失败。
+    d = None
+    for c in reversed(chain):
+        d = _deform_of(rig, c, _DEF_STRIP_FK_RE)
+        if d:
+            break
+    if not d:
+        return False
+    return _snap_by_matrix(rig, [(lb.ik_controls[0], d)]) > 0
+
+
+def _limb_deform_names(rig, lb):
+    """这条肢体自己的变形骨（判定用的量测集，不含全身）。
+
+    v5.2.1 判定时量整根骨架 795 根骨：任何一根与本次切换无关的骨头
+    （头发、另一条手臂、表情骨）只要转了 15°，切换就被判失败。
+    Dialyn-琉音 上「自算 24 mm / 转 15°」正是这么被判死的。
+
+    v5.2.10：无 ORG/DEF 的前缀式绑定（FK_Upperarm.L / IK_Hand.L 这类，
+    游戏系 rig）`_deform_of` 全部落空 —— 量测集退化成控制器本身，吸附
+    本来就要动控制器，位移全是假阳性，两条路都会被判「切不过去」。
+    这里对落空的控制器按 rest 头部位置找最近的变形骨兜底。
+    """
+    out = []
+    pool = None
+    for c in lb.fk_controls:
+        d = _deform_of(rig, c, _DEF_STRIP_FK_RE)
+        if d is None:
+            if pool is None:
+                pool = _deform_pool(rig)
+            d = _nearest_deform_head(rig, c, pool) if pool else None
+        if d and d not in out:
+            out.append(d)
+    for c in lb.ik_controls:
+        d = _deform_of(rig, c, _DEF_STRIP_IK_RE)
+        if d is None:
+            if pool is None:
+                pool = _deform_pool(rig)
+            d = _nearest_deform_head(rig, c, pool) if pool else None
+        if d and d not in out:
+            out.append(d)
+    # 拧转 / 拉伸骨不能进量测集：IK 和 FK 用的是两套扭量分配，
+    # 往返切一次，同一根 `ORG-ForearmTwist01.L` 能差 77°，而手的位置只差
+    # 5 mm、蒙皮看着一模一样（实测第二次 IK→FK 必被判「转 77°」卡死）。
+    # 它们本来就是「为了不扭坏皮肤才存在的补偿骨」，不是姿势。
+    out = [n for n in out if not _TWIST_HELPER_RE.search(n)]
+    return out or list(lb.fk_controls) + list(lb.ik_controls)
+
+
+def _ik_plan(rig, lb):
+    """给「切到 IK」准备一份修正计划：末端控制器、髋/膝/踝三根变形骨、pole。
+
+    自算快照只能做到「大概对」（这根 rig 上踝差 6 mm、膝差 15 mm）。切完之后
+    还要靠这份计划做几何收敛：按踝残差平移末端目标，按膝残差绕 髋→踝 轴把
+    pole 转到目标方向。两三次就到 5 mm 以内。
+    """
+    if len(lb.fk_controls) < 3:
+        return None
+    pool = _deform_pool(rig)
+    chain = []
+    for n in lb.fk_controls[:3]:
+        d = _deform_of(rig, n, _DEF_STRIP_FK_RE)
+        if d is None and pool:
+            d = _nearest_deform_head(rig, n, pool)
+        chain.append(d)
+    if not all(chain):
+        return None
+    end_ctrl = None
+    end_def = chain[2]
+    for c in lb.ik_controls:
+        low = c.lower()
+        if "target" in low or "pole" in low:
+            continue
+        d = _deform_of(rig, c, _DEF_STRIP_IK_RE)
+        if d is None and pool:
+            d = _nearest_deform_head(rig, c, pool)
+        if d == end_def:
+            end_ctrl = c
+            break
+    if end_ctrl is None:
+        return None
+    poles = [c for c in lb.ik_controls
+             if "target" in c.lower() or "pole" in c.lower()]
+    # 没有 pole 目标的 IK 链（RIG-Skins 的腿就是：IK 约束上 pole_subtarget
+    # 是空的），膝盖朝向由链根的朝向决定 —— 那就转链根那根控制骨来摆膝盖。
+    steer = None
+    if not _limb_has_real_pole(rig, lb):
+        steer = _limb_steer_bone(rig, lb, chain[0])
+    return {'root_def': chain[0], 'mid_def': chain[1], 'end_def': end_def,
+            'end_ctrl': end_ctrl, 'poles': poles, 'steer': steer}
+
+
+def _limb_has_real_pole(rig, lb):
+    """这条肢体的 IK 约束上到底挂了 pole 目标没有。"""
+    pool = set(lb.ik_controls) | set(lb.fk_controls)
+    for pb in rig.pose.bones:
+        for c in pb.constraints:
+            if c.type == 'IK' and c.pole_subtarget and c.pole_subtarget in pool:
+                return True
+    return False
+
+
+def _limb_steer_bone(rig, lb, root_def):
+    """没 pole 时用来摆膝盖（手肘）朝向的控制骨：IK 侧的链根，如 `Hip_ik_L`。"""
+    for c in lb.ik_controls:
+        low = c.lower()
+        if "target" in low or "pole" in low or "heel" in low or "spin" in low:
+            continue
+        try:
+            if _deform_of(rig, c, _DEF_STRIP_IK_RE) == root_def:
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def _search_bend(apply_angle):
+    """一维搜索弯曲角：先保扭转，再在这一带里挑位置最准的。
+
+    扭转 100° 和位置差 4 cm 视觉上不是一个量级 —— 所以先用「扭转 + 3°」
+    圈出一个可接受区间，再在区间内按位置误差挑。返回最终角度（度）。
+    """
+    samples = []
+
+    def probe(deg):
+        rot, pos = apply_angle(deg)
+        samples.append((float(deg), rot, pos))
+        return rot, pos
+
+    probe(0.0)
+    for deg in range(-180, 181, 45):
+        probe(float(deg))
+    best_rot = min(s[1] for s in samples)
+    near = [s for s in samples if s[1] <= best_rot + 3.0]
+    best_deg = min(near, key=lambda s: s[2])[0]
+    for step in (12.0, 4.0):
+        around = best_deg
+        cand = []
+        for k in (-2, -1, 1, 2):
+            deg = around + k * step
+            rot, pos = probe(deg)
+            cand.append((deg, rot, pos))
+        best_rot = min(c[1] for c in cand)
+        good = [c for c in cand if c[1] <= best_rot + 3.0]
+        best_deg = min(good, key=lambda c: c[2])[0]
+    apply_angle(best_deg)
+    return best_deg
+
+
+def _skin_quats(rig):
+    out = {}
+    for name in _measured_bones(rig):
+        pb = rig.pose.bones.get(name)
+        if pb is not None:
+            out[name] = pb.matrix.to_quaternion().copy()
+    return out
+
+
+def _refine_ik(rig, plan, want, want_q=None):
+    """几何收敛：踝对点、膝对**方向**（连膝盖的扭转一起对）。
+
+    实测这套 rig：脚踝对好之后，膝盖位置还差 2 cm，而 DEF-shin 的**扭转**
+    能差 112° —— 换 pole 绕 髋→踝 轴的角度能把这个扭转从 112° 压到 7°，
+    位置几乎不变。所以最后一步是拿 pole 角度做一维搜索，用
+    「扭转角 + 150 × 位置误差」当代价，先粗扫 15° 再细扫 5°。
+    """
+    if not plan:
+        return 0
+    want_q = want_q or {}
+    mid_name = plan.get('mid_def') or ""
+    for _ in range(2):
+        moved = 0
+        ec = rig.pose.bones.get(plan.get('end_ctrl') or "")
+        ed = rig.pose.bones.get(plan.get('end_def') or "")
+        md = rig.pose.bones.get(mid_name)
+        rd = rig.pose.bones.get(plan.get('root_def') or "")
+        if ec is not None and ed is not None and want.get(plan.get('end_def')):
+            err = want[plan['end_def']] - ed.matrix.translation
+            if err.length > 1e-4:
+                mm = ec.matrix.copy()
+                mm.translation = mm.translation + err
+                ec.matrix = mm
+                _flush_rig(rig)
+                moved += 1
+        poles = [pn for pn in (plan.get('poles') or [])
+                 if rig.pose.bones.get(pn) is not None]
+        steer_pb = rig.pose.bones.get(plan.get('steer') or "")
+        if (md is not None and rd is not None and ed is not None
+                and mid_name in want_q and mid_name in want
+                and (poles or steer_pb is not None)):
+            root = rd.matrix.translation.copy()
+            goal = ed.matrix.translation.copy()
+            axis = goal - root
+            if axis.length > 1e-5:
+                an = axis.normalized()
+                q_want = want_q[mid_name]
+                tgt = want[mid_name]
+
+                def measure():
+                    _flush_rig(rig)
+                    pos_err = (md.matrix.translation - tgt).length
+                    d = md.matrix.to_quaternion().rotation_difference(q_want)
+                    deg_err = math.degrees(d.angle)
+                    return min(deg_err, 360.0 - deg_err), pos_err
+
+                if poles:
+                    # 常规路：绕 髋→踝 轴摆 pole
+                    base = [rig.pose.bones[pn].matrix.translation.copy() - root
+                            for pn in poles]
+
+                    def apply_angle(deg):
+                        rot = Matrix.Rotation(math.radians(deg), 4, an)
+                        for pn, off in zip(poles, base):
+                            pb2 = rig.pose.bones[pn]
+                            mm = pb2.matrix.copy()
+                            mm.translation = root + (rot @ off)
+                            pb2.matrix = mm
+                        return measure()
+                else:
+                    # 兜底路：这条 IK 链没挂 pole —— 绕同一根轴转**链根**控制骨，
+                    # 大腿跟着转、IK 把脚踝钉住，膝盖就绕着这根轴挪到该在的地方
+                    steer_base = steer_pb.matrix.copy()
+
+                    def apply_angle(deg):
+                        rot = Matrix.Rotation(math.radians(deg), 4, an)
+                        spin = (Matrix.Translation(root) @ rot
+                                @ Matrix.Translation(-root))
+                        steer_pb.matrix = spin @ steer_base
+                        return measure()
+
+                best_deg = _search_bend(apply_angle)
+                if abs(best_deg) > 1.0:
+                    moved += 1
+        if not moved:
+            break
+    return 1
+
+
+def _fk_pairs_and_mats(rig, lb):
+    """FK 方向的配对 + 翻转开关前那一瞬间的源矩阵。
+
+    为什么要存矩阵：FK 控制器的父级是 `MCH-upper_arm_parent` / `MCH-hand_fk`
+    这种跟着开关变形的机制骨。翻开关的一刻父级会动，控制器被一起带走 ——
+    实测手偏 10 cm。所以翻完必须拿「翻转前的世界矩阵」再对一次，迭代到收敛。
+    """
+    pool = _deform_pool(rig)
+    pairs, mats = [], {}
+    for c in lb.fk_controls:
+        d = _deform_of(rig, c, _DEF_STRIP_FK_RE)
+        if d is None and pool:
+            d = _nearest_deform_head(rig, c, pool)
+        if not d:
+            continue
+        src = rig.pose.bones.get(d)
+        if src is None:
+            continue
+        pairs.append((c, d))
+        mats[d] = src.matrix.copy()
+    return pairs, mats
+
+
+def _apply_saved(rig, pairs, mats):
+    n = 0
+    for tgt_name, src_name in pairs:
+        tgt = rig.pose.bones.get(tgt_name)
+        src_b = rig.data.bones.get(src_name)
+        M = mats.get(src_name)
+        if tgt is None or src_b is None or M is None:
+            continue
+        tgt.matrix = M @ (src_b.matrix_local.inverted() @ tgt.bone.matrix_local)
+        _flush_rig(rig)
+        n += 1
+    return n
+
+
+def _refine_fk(rig, plan):
+    """翻开关之后按保存的矩阵再对齐 2 轮（父级变了，得跟着收敛）。"""
+    if not plan:
+        return 0
+    pairs, mats = plan.get('fk_pairs') or [], plan.get('fk_mats') or {}
+    if not pairs or not mats:
+        return 0
+    for _ in range(3):
+        if not _apply_saved(rig, pairs, mats):
+            return 0
+        _flush_rig(rig)
+    return 1
+
+
+def _native_call(lb, target):
+    """这个方向到底有没有「可用的」原生 snap。
+
+    Dialyn-琉音 的 UI 脚本里，手臂那颗标着 `FK->IK (hand.L)` 的按钮，props 是
+    `output_bones = [upper_arm_fk.L, forearm_fk.L, hand_fk.L]`、
+    `input_bones = [upper_arm_ik.L, MCH-forearm_ik.L, MCH-upper_arm_ik_target.L]`。
+    而 rig_ui 的通用快照是「读 input、写 output」——
+    也就是说这颗按钮**写的是 FK 骨**，实际方向是 IK→FK，跟标签正好相反。
+    v5.2.1 拿它当 FK→IK 用：一按就把摆好的 FK 姿势抹回 rest（实测手直接飞
+    393 mm），随后翻开关，等于把姿势整个丢掉。
+    现在按 output_bones 反查方向，方向对不上就当没有原生可用，走自算快照。
+    """
+    call = lb.rigify_to_fk if target == "FK" else lb.rigify_to_ik
+    if call is None:
+        return None
+    op_id, props = call
+    try:
+        out = set(_as_names((props or {}).get("output_bones")))
+    except Exception:
+        out = set()
+    if target == "IK" and out and out == set(lb.fk_controls):
+        return None
+    return call
+
+
+def _switch_once(rig, lb, target, kind):
+    """做一次快照+翻开关。kind = 'native'（rig 自带 snap）/ 'calc'（自算矩阵）。
+
+    返回 (ok, why, plan)。
+    """
+    if target == "IK":
+        plan = _ik_plan(rig, lb)
+    else:
+        pairs, mats = _fk_pairs_and_mats(rig, lb)
+        plan = {'fk_pairs': pairs, 'fk_mats': mats}
+    # v5.2.3：这里原来会先调 _snap_pole()「摆正 pole」。在 Rigify 系骨架里那一步
+    # 会把真正的 IK 目标骨挪走 22~84 cm，后面读到的全是坏状态。
+    # 现在挪 pole 统一放到翻完开关之后（_pole_optimize），改不动就还原。
+    if kind == "native":
+        call = _native_call(lb, target)
+        if call is None:
+            return False, "没有可用的原生 snap", plan
+        op_id, props = call
+        try:
+            mod, _, name = op_id.partition(".")
+            if mod != "pose" and "." in op_id:
+                # 自定义绑定的 snap 按钮不在 pose 空间（sanby_rig.ik_fk_arm 这类）
+                fn = getattr(getattr(bpy.ops, mod, None), name, None)
+            else:
+                fn = getattr(bpy.ops.pose, name, None)
+        except Exception:
+            fn = None
+        if fn is None:
+            return False, "snap 没注册", plan
+        try:
+            ret = fn(**_op_prop_kwargs(op_id, props))
+        except Exception as exc:
+            return False, str(exc), plan
+        if not (isinstance(ret, (set, frozenset)) and 'FINISHED' in ret):
+            return False, "snap 返回 %s" % (ret,), plan
+        return True, "", plan
+    if getattr(lb, "is_finger", False):
+        return (True, "", plan) if _finger_calc(rig, lb, target) \
+            else (False, "手指快照配不上骨骼", plan)
+    pairs = lb.pairs_to_fk if target == "FK" else lb.pairs_to_ik
+    done = _snap_by_matrix(rig, pairs) if pairs else 0
+    if not done and not _snap_generic(rig, lb, target):
+        return False, "自算快照配不上骨骼", plan
+    return True, "", plan
 
 
 def limb_switch(rig, lb, target, hide_other=True):
-    """切到 target（'IK' / 'FK'）：先快照姿态，再翻开关，最后换控制器可见性。"""
+    """切到 target（'IK' / 'FK'），并**保证模型姿势不跳**。
+
+    v5.1 及以前就是「调一遍 rig 自带 snap → 翻 IK_FK」。两个坑：
+      1. `fn(**props)` 不看返回值 —— snap 被 CANCELLED 也照样翻开关，
+         约束一换，模型瞬间弹回 rest（用户报的那个跳变）；
+      2. Rigify 的 FK→IK 只搬目标点、不动 pole。腿上次用 IK 时 pole 在
+         别处，膝盖会当场翻向，实测脚趾能甩 53 cm。
+    v5.2 改成「两条路都试一遍、量了再选」：
+      · native —— rig 自带 snap（快，但各家的按钮语义未必一致）；
+      · calc   —— 自己按变形骨矩阵摆目标点 + 解析摆 pole。
+    每条路量一次蒙皮骨的最大**位移**和最大**旋转**（只看位置会漏掉
+    「脚踝对上了、脚掌却转了 78°」这种），两项都归一化到各自阈值后取小的
+    那条；两条都超（位移 12 cm / 转角 15°）或者干脆没路可走，就
+    **整根还原 + 保持原模式**，绝不交出炸姿势。
+    """
     cur = limb_mode(rig, lb)
     if cur is None:
         return False, "读不到 %s 的 %s" % (lb.prop_bone, lb.prop_name)
@@ -7487,38 +11340,121 @@ def limb_switch(rig, lb, target, hide_other=True):
             ikfk_sync_visibility(rig, lb, target)
         return False, "%s 已经是 %s" % (lb.label, target)
 
-    call = lb.rigify_to_fk if target == "FK" else lb.rigify_to_ik
-    if call is not None:
-        op_id, props = call
-        fn = getattr(bpy.ops.pose, op_id.split(".")[-1], None)
-        if fn is None:
-            return False, "Rigify 的 snap 没注册：请勾选「自动运行脚本」后重开文件"
-        try:
-            fn(**props)
-        except Exception as exc:
-            return False, "Rigify snap 出错：%s" % exc
-    else:
-        pairs = lb.pairs_to_fk if target == "FK" else lb.pairs_to_ik
-        if not pairs:
-            return False, "%s 没有可以快照的骨骼" % lb.label
-        if _snap_by_matrix(rig, pairs) == 0:
-            return False, "%s 快照失败" % lb.label
-
     pb = rig.pose.bones.get(lb.prop_bone)
-    if pb is not None and lb.prop_name in pb:
+    if pb is None or lb.prop_name not in pb:
+        return False, "读不到 %s 的 %s" % (lb.prop_bone, lb.prop_name)
+    want = lb.fk_value if target == "FK" else lb.ik_value
+    try:
+        orig = float(pb[lb.prop_name])
+    except Exception:
+        return False, "读不到 %s 的值" % lb.prop_name
+
+    state = _pose_state(rig)
+    # v5.2.3：判定只看这条肢体自己的骨头。
+    # 原来量全骨 795 根 —— 只要有一根头发骨 / 另一条手臂的骨转了 15.1°，
+    # 明明手已经对齐的切换也会被判「切不过去」。Dialyn-琉音 上 14 根肢体
+    # 全军覆没就是这么来的（自算位移 24 mm、转角 15°，卡在阈值上）。
+    # 全身只留「位移 12 cm」这一道兜底，那是真的炸了才会触发。
+    meas = _limb_deform_names(rig, lb)
+    skin = {n: rig.pose.bones[n].matrix.translation.copy()
+            for n in meas if rig.pose.bones.get(n) is not None}
+    skin_q = {n: rig.pose.bones[n].matrix.to_quaternion().copy()
+              for n in meas if rig.pose.bones.get(n) is not None}
+    glob = _skin_positions(rig)
+
+    has_native = bool(lb.rigify_to_fk or lb.rigify_to_ik)
+    if getattr(lb, "is_finger", False):
+        # 手指的链骨（f_index.01/.02/.03）没有和变形骨一一对应，
+        # 自算只能对到指尖位置，精度不如原生 —— 所以原生在前、兜底在后。
+        order = ["native", "calc"] if has_native else ["calc"]
+    else:
+        # 自算在前：它按「变形骨矩阵」走，结果可验证；反正是两条都量，
+        # 自带 snap 更好的话会被选上，顺序不影响结果，只影响默认偏好。
+        order = ["calc", "native"] if has_native else ["calc"]
+
+    best = None
+    notes = []
+    for kind in order:
+        _pose_restore(rig, state)
         try:
-            pb[lb.prop_name] = (lb.fk_value if target == "FK"
-                                else (0.0 if lb.fk_value >= 0.5 else 1.0))
+            pb[lb.prop_name] = orig
         except Exception:
             pass
+        _flush_rig(rig)
+        ok, why, plan = _switch_once(rig, lb, target, kind)
+        if not ok:
+            notes.append("%s:%s" % ("自带" if kind == "native" else "自算", why))
+            continue
+        try:
+            pb[lb.prop_name] = want
+        except Exception:
+            pass
+        _flush_rig(rig)
+        if target == "IK":
+            # 切完先看 pole 能不能真的改善中段，再做一轮几何收敛
+            try:
+                _pole_optimize(rig, lb, plan, skin)
+                _refine_ik(rig, plan, skin, skin_q)
+            except Exception:
+                pass
+        else:
+            # FK 方向：父级机制骨跟着开关动过，按翻转前的矩阵再对一次
+            try:
+                _refine_fk(rig, plan)
+            except Exception:
+                pass
+        drift = _skin_drift(rig, skin)
+        ang = _skin_rot_drift(rig, skin_q)
+        gdrift = _skin_drift(rig, glob)
+        # 位置和旋转都归一化到自己的阈值上再相加 —— 只看位置的话，
+        # 「脚踝对上了、整只脚却转过去 78°」会被判成完美切换。
+        cost = drift / _POSE_DRIFT_LIMIT + ang / _POSE_ANG_LIMIT
+        if drift > _POSE_DRIFT_LIMIT or ang > _POSE_ANG_LIMIT:
+            notes.append("%s:位移 %.0f mm / 转 %.0f°" % (
+                "自带" if kind == "native" else "自算",
+                drift * 1000, math.degrees(ang)))
+        if best is None or cost < best[0]:
+            best = (cost, drift, ang, kind, _pose_state(rig),
+                    float(pb[lb.prop_name]), gdrift)
+        if cost <= 1.0:
+            break
+
+    # 两档判定：
+    #   · cost ≤ 1.0            —— 完全无感，静默；
+    #   · 肢体位移 ≤ 6 cm、转 ≤ 30°、全身位移 ≤ 12 cm —— 照切，结果里写明残差。
+    #     「切不过去」比「肘偏 2 cm」更糟：用户会卡死在当前模式里出不来。
+    #   · 超出上面任何一条 —— 整根还原，绝不交出炸掉的姿势。
+    ok_soft = (best is not None
+               and best[1] <= _ACCEPT_DRIFT
+               and best[2] <= _ACCEPT_ANG
+               and best[6] <= _POSE_DRIFT_LIMIT)
+    if best is None or (best[0] > 1.0 and not ok_soft):
+        _pose_restore(rig, state)
+        try:
+            pb[lb.prop_name] = orig
+        except Exception:
+            pass
+        _flush_rig(rig)
+        why = "；".join(notes) if notes else ("位移 %.0f mm" % (best[1] * 1000)
+                                            if best else "没有可用的快照方式")
+        return False, "%s 这套姿势切不过去（%s），已保持原模式" % (lb.label, why)
+
+    # 落最优的那条：恢复它的姿势，属性也跟着它的值
+    _pose_restore(rig, best[4])
     try:
-        rig.update_tag()
-        bpy.context.view_layer.update()
+        pb[lb.prop_name] = best[5]
     except Exception:
         pass
+    _flush_rig(rig)
     if hide_other:
         ikfk_sync_visibility(rig, lb, target)
-    return True, "%s → %s" % (lb.label, target)
+    msg = "%s → %s" % (lb.label, target)
+    if best[1] > 0.005:
+        msg += "（最大位移 %.0f mm" % (best[1] * 1000)
+        if best[2] > math.radians(2.0):
+            msg += " / 转 %.1f°" % math.degrees(best[2])
+        msg += "）"
+    return True, msg
 
 
 def _counterpart_name(name, target):
@@ -7550,7 +11486,19 @@ def _limbs_for_bones(limbs, bone_names):
             if (set(lb.ik_controls) | set(lb.fk_controls)) & pool]
 
 
-_PRIMARY_WORDS = ("hand", "foot", "wrist", "ankle")
+# 「主控制器」候选词，按「离末端由近到远」分档。一档里全没命中才看下一档 ——
+# 之前是一张平词表，`Hip_ik_L` 和 `Ankle_ik_L` 同权，谁排前面选谁，
+# 于是腿格第一根落在大腿根部而不是脚底。
+_PRIMARY_TIERS = (
+    ("hand", "wrist", "foot", "ankle", "toe", "fingers"),
+    ("knee", "elbow", "head", "neck"),
+    ("hip", "thigh", "shoulder", "clavicle", "pelvis", "chest",
+     "spine", "torso", "root"),
+)
+# 同一档里的非主控制骨：pole / 目标点 / 脚跟翻转 / 抓握辅助 / 属性开关
+_PRIMARY_BAD_RE = re.compile(
+    r"(parent|prop|target|pole|heel|spin|roll|follow|twist|switch"
+    r"|license|licence|watermark|属性|水印)", re.I)
 
 
 def _primary_control(names):
@@ -7559,13 +11507,18 @@ def _primary_control(names):
     自动跳选中时的兜底：手 IK 切成 FK 之后该落到 c_hand_fk 上，落到
     c_arms_pole 或者 c_thigh_fk 上都没法接着转。
     """
-    for n in names:
-        low = n.lower()
-        if low.startswith("c_"):
-            low = low[2:]
-        if any(w in low for w in _PRIMARY_WORDS):
-            return n
-    return names[0] if names else None
+    names = [n for n in (names or []) if n]
+    if not names:
+        return None
+    pool = [n for n in names if not _PRIMARY_BAD_RE.search(n)] or names
+    for tier in _PRIMARY_TIERS:
+        for n in pool:
+            low = n.lower()
+            if low.startswith("c_"):
+                low = low[2:]
+            if any(w in low for w in tier):
+                return n
+    return pool[0]
 
 
 def _move_selection(rig, old_name, lb, target):
@@ -7646,6 +11599,24 @@ def _key_limb(rig, lb):
     return count
 
 
+class POSE_OT_cn_ikfk_fingers_v45(bpy.types.Operator):
+    """展开 / 收起手指那 10 条 IK-FK（面板别再被撐得老长）"""
+    bl_idname = "pose.cn_ikfk_fingers_v45"
+    bl_label = "手指 IK/FK 展开"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.object is not None
+                and context.object.type == 'ARMATURE')
+
+    def execute(self, context):
+        rig = context.object
+        cur = bool(rig.data.get("cn_ikfk_fingers", 1))
+        rig.data["cn_ikfk_fingers"] = 0 if cur else 1
+        return {'FINISHED'}
+
+
 class POSE_OT_cn_ikfk_toggle_v45(bpy.types.Operator):
     """选中控制器按一下就切到另一边，并把离开的那套控制器收起来"""
     bl_idname = "pose.cn_ikfk_toggle_v45"
@@ -7694,17 +11665,25 @@ class POSE_OT_cn_ikfk_toggle_v45(bpy.types.Operator):
 
         sel = _selected_bone_names(context, rig)
         moved, last, done = 0, None, []
+        msgs = []
         for lb in picked:
             cur = limb_mode(rig, lb)
             tgt = self.target if self.target in ("IK", "FK") else (
                 "FK" if cur == "IK" else "IK")
-            ok, _msg = limb_switch(rig, lb, tgt)
+            ok, msg = limb_switch(rig, lb, tgt)
             if ok:
                 moved += 1
                 last = (lb, tgt)
                 done.append(lb)
+            elif msg:
+                msgs.append(msg)
         if not moved:
-            self.report({'INFO'}, "已经在目标模式了")
+            # 别再一律报「已经在目标模式了」—— 真正的原因（已经是 / 切不过去）
+            # 必须让用户看见，否则他会以为插件坏了
+            if msgs:
+                self.report({'WARNING'}, "；".join(msgs[:3]))
+            else:
+                self.report({'INFO'}, "已经在目标模式了")
             return {'CANCELLED'}
 
         if last is not None and not self.all_limbs:
@@ -7730,7 +11709,10 @@ class POSE_OT_cn_ikfk_popup_v45(bpy.types.Operator):
 
     # 面板宽 238：v5.0 用 popup_menu 自绘，宽度由内容撑开，在四视图里
     # 会被拉成一整条横贯屏幕的长条（用户报「面板太大」）。改成定宽弹窗。
-    WIDTH = 238
+    # v5.2.24：238 太窄 —— SAnby 系开关名（Leg_IK_FK.R）在名称列被截成
+    # 「Leg_IK...」（用户：前面的文字要显示全）。加宽到 296，名称列
+    # 占比 0.55 → 0.78；「FK → IK」按钮文字本身短，不受影响。
+    WIDTH = 296
 
     @classmethod
     def poll(cls, context):
@@ -7775,15 +11757,18 @@ def draw_ikfk_popup_body(layout, context):
 
     head = layout.row(align=True)
     head.label(text="IK / FK", icon='ARMATURE_DATA')
-    head.label(text="%d" % len(limbs))
+    n_finger = sum(1 for lb in limbs if getattr(lb, "is_finger", False))
+    head.label(text="%d" % (len(limbs) - n_finger))
 
     col = layout.column(align=True)
     for lb in limbs:
+        if getattr(lb, "is_finger", False):
+            continue
         mode = limb_mode(rig, lb) or "?"
         tgt = "FK" if mode == "IK" else "IK"
         row = col.row(align=True)
         name = row.row(align=True)
-        name.scale_x = 0.55
+        name.scale_x = 0.78
         name.label(text=("● %s" if lb in picked else "%s") % lb.label)
         op = row.operator("pose.cn_ikfk_toggle_v45",
                           text="%s → %s" % (mode, tgt))
@@ -7798,6 +11783,9 @@ def draw_ikfk_popup_body(layout, context):
     op = row.operator("pose.cn_ikfk_toggle_v45", text="全部 → FK")
     op.target = "FK"
     op.all_limbs = True
+    if n_finger:
+        layout.label(text="手指 IK/FK %d 条：侧栏面板里切" % n_finger,
+                     icon='INFO')
     if kind == "rigify":
         layout.label(text="Rigify 原生 snap", icon='CHECKMARK')
 
@@ -7816,11 +11804,13 @@ def draw_ikfk_items(layout, context):
     sel = set(_selected_bone_names(context, rig))
     picked = _limbs_for_bones(limbs, sel)
 
-    col = layout.column(align=True)
-    for lb in limbs:
+    body = [lb for lb in limbs if not getattr(lb, "is_finger", False)]
+    fingers = [lb for lb in limbs if getattr(lb, "is_finger", False)]
+
+    def limb_row(holder, lb):
         mode = limb_mode(rig, lb) or "?"
         mark = "● " if lb in picked else ""
-        row = col.row(align=True)
+        row = holder.row(align=True)
         row.label(text="%s%s" % (mark, lb.label))
         sub = row.row(align=True)
         sub.scale_x = 0.85
@@ -7832,6 +11822,23 @@ def draw_ikfk_items(layout, context):
         tag = sub.row(align=True)
         tag.scale_x = 0.7
         tag.label(text=mode)
+
+    col = layout.column(align=True)
+    for lb in body:
+        limb_row(col, lb)
+
+    if fingers:
+        fbox = layout.box()
+        fhead = fbox.row(align=True)
+        opened = bool(rig.data.get("cn_ikfk_fingers", 1))
+        fop = fhead.operator("pose.cn_ikfk_fingers_v45", text="手指 IK/FK",
+                             icon='TRIA_DOWN' if opened else 'TRIA_RIGHT',
+                             emboss=False)
+        fhead.label(text="%d 个" % len(fingers))
+        if opened:
+            fcol = fbox.column(align=True)
+            for lb in fingers:
+                limb_row(fcol, lb)
 
     layout.separator()
     row = layout.row(align=True)
@@ -8156,7 +12163,7 @@ def draw_controller_nav_section(layout, context):
     head.label(text="驭骨 · BonePilot", icon='ARMATURE_DATA')
     head.label(text="集合 / IK-FK")
 
-    names = [n for n in preset_names() if rig.data.collections.get(n) is not None]
+    names = [n for n in preset_names() if _coll_get(rig, n) is not None]
     if names:
         cur = rig.data.get("cn_collection") or selection_collection_name(rig)
         col = box.column(align=True)
@@ -8272,7 +12279,14 @@ class VIEW3D_PT_controller_nav_v45(bpy.types.Panel):
 
             cur_col = nav_collection(rig, cur)
             if cur_col is not None:
-                box.label(text=cur_col.name, icon='COLLECTION_COLOR_01')
+                crow = box.row(align=True)
+                crow.label(text=cur_col.name, icon='COLLECTION_COLOR_01')
+                solo_now = solo_collection_name(rig) == cur_col.name
+                sc = crow.operator(
+                    "pose.cn_solo_collection_v45", text="独显" if not solo_now else "还原",
+                    icon=safe_icon('SOLO_ON') if solo_now else safe_icon('SOLO_OFF'),
+                    depress=solo_now)
+                sc.collection = cur_col.name
                 row = box.row(align=True)
                 row.operator_menu_enum("pose.cn_set_collection_motion_v45", "mode",
                                        text="动作：" + dict((k, v) for k, v, _ in MOTION_MODE_ITEMS).get(
@@ -8291,6 +12305,69 @@ class VIEW3D_PT_controller_nav_v45(bpy.types.Panel):
                 opd = row.operator("pose.cn_first_bone_v45",
                                    text="设为当前选中" if dflt else "选中骨骼设为默认")
                 opd.clear = False
+
+                # ── 集合里的骨骼顺序（v5.2.6：只留点选排序）──────────────
+                # 点一下开始 → 视图里一根一根加选 → 点回来写入。
+                # 排第一的那根就是进集合先选中的那根，↑↓ 也从它开始走。
+                col_bones = collection_bone_names(rig, cur_col)
+                custom = bone_order_is_custom(rig, cur_col.name)
+                bopen = bool(getattr(prefs, "bone_order_open", False)) if prefs is not None else False
+                bh = box.row(align=True)
+                if prefs is not None:
+                    bh.prop(prefs, "bone_order_open", text="", emboss=False,
+                            icon='TRIA_DOWN' if bopen else 'TRIA_RIGHT')
+                bh.label(text="骨骼顺序（%d 根%s）" % (
+                    len(col_bones), "，已自定义" if custom else ""),
+                    icon=safe_icon('SORTALPHA'))
+                if bopen:
+                    if collection_sort_mode(rig, cur_col) != 'ASSIGN':
+                        box.label(text="当前排序是「%s」—— 排一次会自动切回集合顺序"
+                                  % collection_sort_label(rig, cur_col), icon='INFO')
+                    st = _PICK_ORDER
+                    armed = (st["armed"] and st["rig"] == rig.name
+                             and st["col"] == cur_col.name)
+                    r1 = box.row(align=True)
+                    r1.scale_y = 1.35
+                    if armed:
+                        txt = ("✓ 写入顺序（已点 %d 根）" % len(st["queue"])
+                               if st["queue"] else "没点骨骼 · 再点一下取消")
+                    else:
+                        txt = "点选排序：点这里开始 → 加选 → 点回来写入"
+                    pk = r1.operator("pose.cn_bone_order_pick_v45", text=txt,
+                                     icon=safe_icon('CURSOR'), depress=armed)
+                    pk.collection = cur_col.name
+                    if armed:
+                        if st["queue"]:
+                            prev = " → ".join(st["queue"][:8])
+                            if len(st["queue"]) > 8:
+                                prev += " …"
+                            box.label(text="已记录：%s" % prev, icon='BLANK1')
+                        else:
+                            box.label(text="现在一根一根点骨骼（加选）：谁被点谁排后面",
+                                      icon='BLANK1')
+                    # 长集合（头发/手指动辄几十根）只列前 24 根
+                    shown = col_bones[:24]
+                    for k, nm in enumerate(shown):
+                        r = box.row(align=True)
+                        r.label(text="%d. %s" % (k + 1, nm),
+                                icon='BONE_DATA' if nm == cur.name else 'BLANK1')
+                        up = r.operator("pose.cn_bone_order_v45", text="",
+                                        icon=safe_icon('TRIA_UP'))
+                        up.collection, up.bone, up.delta = cur_col.name, nm, -1
+                        dn = r.operator("pose.cn_bone_order_v45", text="",
+                                        icon=safe_icon('TRIA_DOWN'))
+                        dn.collection, dn.bone, dn.delta = cur_col.name, nm, 1
+                        rm = r.operator("pose.cn_bone_order_v45", text="", icon='X')
+                        rm.collection, rm.bone, rm.remove = cur_col.name, nm, True
+                    if len(col_bones) > len(shown):
+                        box.label(text="……还有 %d 根（列表只显示前 24 根，用点选排序整段排）"
+                                  % (len(col_bones) - len(shown)), icon='BLANK1')
+                    if custom:
+                        rs = box.row(align=True).operator(
+                            "pose.cn_bone_order_v45", text="恢复 assign 原顺序",
+                            icon=safe_icon('LOOP_BACK'))
+                        rs.collection, rs.reset = cur_col.name, True
+                    box.label(text="顺序只影响滚轮 / ↑↓ 的先后，不改集合成员", icon='BLANK1')
 
         # ---- 骨骼操作：选中骨骼的动作模式 + 轴锁，紧贴上面的骨骼信息
         # 这三块是同一件事（这根骨骼能怎么动），v4.9.89 起连在一起，
@@ -8346,9 +12423,36 @@ class VIEW3D_PT_controller_nav_v45(bpy.types.Panel):
 
         # 饼菜单：三层（主饼/细节饼/附属饼），各 8 格，点名字换集合
         # 每块都能折叠 —— 主饼配好之后基本不用再看，收起来省一大截滚动
+        # 一键配置（v5.1）：直接读骨架原生的集合，自动归类进三层饼。
+        # 新角色 / 新绑定打开就能点，不用先去偏好里配一套名字。
+        abox = layout.box()
+        arow = abox.row(align=True)
+        arow.scale_y = 1.45
+        arow.operator("pose.cn_auto_layout_v45",
+                      text="一键配置饼菜单", icon='AUTO')
+        cnt = [sum(1 for g in pie_slot_groups(rig, ly) if g) for ly in (1, 2, 3)]
+        abox.label(text="主饼 %d 格 · 细节 %d 格 · 附属 %d 格 ／ 原生集合 %d 个"
+                   % (cnt[0], cnt[1], cnt[2], len(_colls(rig))),
+                   icon='COLLECTION_COLOR_01')
+        if prefs is not None:
+            # 星标饼：默认开着（用户实测比原生饼顺手）；关了就回原生饼，键位一样
+            abox.prop(prefs, "pie_custom", text="饼用星标饼（自绘 · 每格带 ★）")
+        if solo_collection_name(rig):
+            srow = abox.row(align=True)
+            srow.label(text="正在独显：%s" % solo_collection_name(rig), icon='SOLO_ON')
+            srow.operator("pose.cn_solo_collection_v45", text="还原", icon='LOOP_BACK').restore = True
+        # 饼间互斥会改集合的显示状态（Blender 没有临时的集合隐藏），
+        # 那是会写进 .blend 的持久数据 —— 给两个按钮兜住这件事。
+        vrow = abox.row(align=True)
+        vrow.scale_y = 0.85
+        vrow.operator("pose.cn_restore_visibility_v45",
+                      text="还原原始显示", icon='LOOP_BACK')
+        vrow.operator("pose.cn_snapshot_visibility_v45",
+                      text="以当前为准", icon='FILE_TICK')
+
         cur_col_pie = pie_current_collection(rig)
         for layer, lname, lhint, licon in PIE_LAYERS:
-            slots = pie_slots(rig, layer)
+            groups = pie_slot_groups(rig, layer)
             pbox = layout.box()
             head = pbox.row(align=True)
             flag = "pie_open_%d" % layer
@@ -8358,7 +12462,7 @@ class VIEW3D_PT_controller_nav_v45(bpy.types.Panel):
                           icon='TRIA_DOWN' if opened else 'TRIA_RIGHT')
             head.label(text="饼菜单 · %s（%s）" % (lname, lhint),
                        icon=safe_icon(licon))
-            if any(slots):
+            if any(groups):
                 opf = head.operator("pose.cn_pie_autofill_v45",
                                     text="", icon='FILE_REFRESH')
                 opf.layer = layer
@@ -8375,26 +12479,44 @@ class VIEW3D_PT_controller_nav_v45(bpy.types.Panel):
                 opf.layer = layer
             if not opened:
                 # 收起来的层给一行摘要：一眼看得出这层配了几个、都放了谁
-                names = [s for s in slots if s]
+                names = [g[0] for g in groups if g]
                 if names:
                     pbox.label(text="  ".join(names[:4]) +
                                ("  …" if len(names) > 4 else ""),
                                icon='DOT')
                 continue
-            for i, name in enumerate(slots):
+            for i, grp in enumerate(groups):
                 row = pbox.row(align=True)
                 row.scale_y = 0.85
                 sub = row.row(align=True)
                 sub.ui_units_x = 3.2
+                name = grp[0] if grp else ""
                 act = bool(name) and name == cur_col_pie
                 sub.label(text=PIE_DIRS[i], icon='LAYER_ACTIVE' if act else 'BLANK1')
+                # 一格挂多个集合时用「+N」收尾，别把整行撑爆
+                label = name
+                if len(grp) > 1:
+                    label = "%s  +%d" % (name, len(grp) - 1)
                 # 和饼里点空格子走同一个入口：点一下直接弹出集合列表
                 opx = row.operator("pose.cn_pie_assign_v45",
-                                   text=name or "（空）",
+                                   text=label or "（空）",
                                    icon='BONE_DATA' if name else 'ADD',
                                    depress=act)
                 opx.slot = i
                 opx.layer = layer
+                # v5.2.16：显式清掉，防算子属性残留把弹窗跳过去
+                opx.collection = ""
+                opx.from_popup = False
+                opx.remove = False
+                opx.append = False
+                # 星标：点一下只显示这个集合（再点一次还原）
+                if name:
+                    solo_now = solo_collection_name(rig) == name
+                    st = row.operator(
+                        "pose.cn_solo_collection_v45", text="",
+                        icon=safe_icon('SOLO_ON') if solo_now else safe_icon('SOLO_OFF'),
+                        depress=solo_now)
+                    st.collection = name
 
     def draw_presets(self, layout, context, rig):
         names = preset_names()
@@ -8421,7 +12543,7 @@ class VIEW3D_PT_controller_nav_v45(bpy.types.Panel):
         grid = pbox.column(align=True)
         arm = rig.data
         for name in names:
-            col = arm.collections.get(name)
+            col = _coll_get(arm, name)
             if col is None:
                 text, icon = "%s   ＋新建" % name, 'ADD'
             else:
@@ -8691,6 +12813,57 @@ class ControllerNavPrefs_v45(bpy.types.AddonPreferences):
     pie_open_2: bpy.props.BoolProperty(name="细节饼展开", default=True)
     pie_open_3: bpy.props.BoolProperty(name="附属饼展开", default=True)
 
+    bone_order_open: bpy.props.BoolProperty(
+        name="展开骨骼顺序",
+        default=False,
+        description="侧栏面板里「骨骼顺序」那一块默认收起来（长集合展开很长），"
+                    "点小箭头展开：点选排序 + 一根一根上下挪。顺序只作用于滚轮/↑↓ 的导航先后",
+    )
+
+    pie_custom: bpy.props.BoolProperty(
+        name="星标饼（自绘）",
+        default=True,
+        description="三个饼用自绘版本：每格外沿一个 ★，滑 ★ 独显该集合，滑格子进入集合。"
+                    "画不出来会自动退回原生饼",
+        update=lambda self, context: refresh_keymap(),
+    )
+
+    # ---- 星标饼形态（v5.2.7：响应速度 / 大小都能自己调）
+    pie_dead_zone: bpy.props.IntProperty(
+        name="触发死区",
+        default=12, min=0, max=120,
+        subtype='PIXEL',
+        description="鼠标离饼心超过这个距离就按方向选中格子 —— 原生饼十几像素就高亮。"
+                    "想更跟手就调小（0 = 一动就选），容易误选就调大",
+    )
+
+    pie_radius: bpy.props.IntProperty(
+        name="饼半径",
+        default=168, min=100, max=320,
+        subtype='PIXEL',
+        description="格子外圈半径（饼有多大）",
+    )
+
+    pie_hole: bpy.props.IntProperty(
+        name="中心孔",
+        default=66, min=8, max=200,
+        subtype='PIXEL',
+        description="中间空心圆半径。只影响外观，选中判定只看「触发死区」",
+    )
+
+    pie_star_size: bpy.props.IntProperty(
+        name="星标大小",
+        default=9, min=3, max=20,
+        subtype='PIXEL',
+        description="每格外沿星标的半径",
+    )
+
+    pie_label_size: bpy.props.IntProperty(
+        name="格子文字",
+        default=13, min=8, max=26,
+        description="格子名字号",
+    )
+
     collection_keys: bpy.props.EnumProperty(
         name="集合切换键",
         items=COLL_KEY_ITEMS,
@@ -8940,6 +13113,34 @@ class ControllerNavPrefs_v45(bpy.types.AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
+
+        # ---- 星标独显（放在最上面：功能新，藏到下面找不到）
+        sbox = layout.box()
+        sbox.label(text="星标饼 / 独显", icon='SOLO_ON')
+        sbox.prop(self, "pie_custom", text="饼菜单用星标饼（自绘 · 每格带 ★）")
+        if self.pie_custom:
+            sbox.label(text="滑到格子 = 高亮，松手进集合（选第一根）；滑到 ★ = 独显这一格，"
+                            "滑回格子就退出独显", icon='CHECKMARK')
+            sbox.label(text="不用真的滑到格子上：给出方向就选中（见下面的「触发死区」）",
+                       icon='CHECKMARK')
+            shape = sbox.column(align=True)
+            shape.label(text="饼形态 / 手感", icon='PREFERENCES')
+            r = shape.row(align=True)
+            r.prop(self, "pie_dead_zone", text="死区")
+            r.prop(self, "pie_label_size", text="字号")
+            r2 = shape.row(align=True)
+            r2.prop(self, "pie_radius", text="半径")
+            r2.prop(self, "pie_hole", text="中心孔")
+            shape.prop(self, "pie_star_size", text="星标大小")
+            shape.label(text="死区 0 = 一动就选；调小更跟手，调大更稳", icon='INFO')
+            sbox.label(text="画不出来（老显卡 / API 变动）会自动退回原生饼，键位不受影响",
+                       icon='INFO')
+        else:
+            sbox.label(text="现在是原生饼：稳，但拿不到悬停事件，也没有外沿星标",
+                       icon='INFO')
+        sbox.label(text="不开星标饼也能独显：侧栏「驭骨」面板每个集合行右边有「独显」按钮，"
+                        "饼菜单配置区每格后面有 ★", icon='INFO')
+        sbox.label(text="独显快照存在骨架里（cn_solo_prev），重开文件也能还原", icon='INFO')
 
         # ---- 快捷键
         kbox = layout.box()
@@ -9202,14 +13403,14 @@ class POSE_OT_cn_delete_empty_collection_v45(bpy.types.Operator):
         rig = context.object
         if rig is None or rig.type != 'ARMATURE':
             return {'CANCELLED'}
-        col = rig.data.collections.get(self.collection or "")
+        col = _coll_get(rig, self.collection or "")
         if col is None:
             self.report({'WARNING'}, "集合不存在")
             return {'CANCELLED'}
         if len(col.bones) != 0:
             self.report({'WARNING'}, "这个集合不是空集合，不能删除")
             return {'CANCELLED'}
-        rig.data.collections.remove(col)
+        _arm_of(rig).collections.remove(col)
         return {'FINISHED'}
 
 
@@ -9282,6 +13483,11 @@ CLASSES = (
     POSE_OT_cn_set_collection_sort_v45,
     POSE_OT_cn_set_bone_motion_v45,
     POSE_OT_cn_set_collection_motion_v45,
+    POSE_OT_cn_bone_order_v45,
+    POSE_OT_cn_bone_order_batch_v45,
+    POSE_OT_cn_bone_order_pick_v45,
+    POSE_OT_cn_solo_collection_v45,
+    POSE_OT_cn_wheel_v45,
     CN_Preset_v45,
     POSE_OT_cn_create_presets_v45,
     POSE_OT_cn_assign_preset_v45,
@@ -9290,6 +13496,11 @@ CLASSES = (
     POSE_OT_cn_pie_jump_v45,
     POSE_OT_cn_pie_note_v45,
     POSE_OT_cn_pie_assign_v45,
+    POSE_OT_cn_slot_order_v45,
+    POSE_OT_cn_slot_swap_v45,
+    POSE_OT_cn_auto_layout_v45,
+    POSE_OT_cn_restore_visibility_v45,
+    POSE_OT_cn_snapshot_visibility_v45,
     POSE_OT_cn_pie_autofill_v45,
     POSE_OT_cn_pie_clear_v45,
     POSE_OT_cn_view_back_v45,
@@ -9316,6 +13527,7 @@ CLASSES = (
     POSE_OT_cn_quick_rotate_v45,
     POSE_OT_cn_lock_axes_v45,
     POSE_OT_cn_ikfk_toggle_v45,
+    POSE_OT_cn_ikfk_fingers_v45,
     POSE_OT_cn_ikfk_popup_v45,
     POSE_OT_cn_key_capture_v45,
     POSE_OT_cn_key_clear_v45,
@@ -9432,8 +13644,13 @@ def register_keymaps():
         key, mods = spec
         try:
             mode = 'CLICK_DRAG' if ('MOUSE' in key and 'WHEEL' not in key) else 'PRESS'
-            kmi = km.keymap_items.new('wm.call_menu_pie', key, mode, **mods)
-            kmi.properties.name = menu_name
+            if bool(pref('pie_custom', False)):
+                # 星标饼：自己画的，才有「移上去就独显」的悬停事件
+                kmi = km.keymap_items.new('pose.cn_wheel_v45', key, mode, **mods)
+                kmi.properties.layer = {'PIE_1': 1, 'PIE_2': 2, 'PIE_3': 3}.get(act, 1)
+            else:
+                kmi = km.keymap_items.new('wm.call_menu_pie', key, mode, **mods)
+                kmi.properties.name = menu_name
             addon_keymaps.append((km, kmi))
         except Exception:
             pass
@@ -9570,6 +13787,7 @@ def unregister():
         try: bpy.app.timers.unregister(h)
         except Exception: pass
         _POPUP_WATCH["timer"] = None
+    _pick_order_timer(False)          # 点选排序的心跳也要收掉
     unregister_keymaps()
     try:
         del bpy.types.Object.cn_spatial
