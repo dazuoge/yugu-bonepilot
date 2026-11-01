@@ -4,7 +4,7 @@ Blender 插件：按集合导航控制器，快速旋转/移动，逐段撤销�
 
 面向 **Blender 5.2+**（Rigify / AniMate / ARP 类骨架均可使用）。
 
-![version](https://img.shields.io/badge/version-5.2.26-informational)
+当前版本：**v5.2.26**（2026-11-01）
 
 ## 下载
 
