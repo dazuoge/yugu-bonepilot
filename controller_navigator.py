@@ -1,6 +1,22 @@
 # -*- coding: utf-8 -*-
 # Controller Navigator v5.0.0 — IK/FK 一键切换 + 全键位自定义 + 集合独占
 #
+# v5.2.39 — 修「旋转还是有几率卡一下、然后姿态猛跳一段」：
+#   现象：不是每次都出现，偶尔拖到一半顿一下，接着姿态窜出去一段。
+#   实测定位（rig.002 / 420 骨 / 219 根带路径）：
+#   ① v5.2.37 把运动路径刷新挪进 bpy.app.timers，但 timer 是**在模态事件之间**
+#      执行的 —— pose.paths_update() 是同步全量重算，实测 154~161 ms，正好
+#      落在拖拽中途，把事件循环冻住这么久；这期间鼠标位移全攒着，恢复后作为
+#      **一个** MOUSEMOVE 进来，dx/dy 上百像素，一次吃进去就是「猛跳一段」。
+#      拖拽事件本身只 0.093 ms/帧（cProfile 实测），所以问题一直在事件之外。
+#      修法：模块级 _GESTURE_T 记录最近一次模态事件时间，timer 在「手还在动」
+#      （<0.30 s）时用返回间隔自我重排、不执行；手停下才刷。上限 16 s 防饿死。
+#   ② 位移突变守卫补上「中途」这一档：原来只有「本段第一帧」有 1/3 视口守卫，
+#      中途攒出来的大位移照单全收。现在任何一帧位移超过 180 px 都按比例截断；
+#      单轴 RIM 的方位角另加 ±25°/帧 限幅（它不读 dx，直接吃绝对方位角）。
+#   效果：卡顿源头（160 ms 同步重算）不再出现在手势里；万一被别的阻塞（撤销、
+#   大重估）卡住，姿态最多前进一小段，不会飞出去。
+#
 # v5.2.38 — 修「自由旋转时姿态会突然猛甩 / 越转越歪」（老问题，v5.2.30 就有）：
 #   根因：`_ensure_baseline()` 发现姿态被动画重估拽走后，会先把姿态写回来、
 #   再把当前姿态冻结成新基线（rebaseline），但**没有清空累计旋转量**。
@@ -169,7 +185,7 @@
 bl_info = {
     "name": "驭骨 · BonePilot",
     "author": "默尔佐",
-    "version": (5, 2, 38),
+    "version": (5, 2, 39),
     "blender": (5, 2, 0),
     "location": "Pose Mode > N 面板 > Nav",
     "description": "驭骨 · BonePilot：按集合导航控制器，快速旋转/移动，逐段撤销，让动画操作跟手",
@@ -281,7 +297,16 @@ def _error_wash():
 # pose.paths_update() 是骨架级全量重算（420 骨 / 219 根带路径实测 245 ms），
 # 放进模态收尾会把操作手感拖回去。这里排队到 timer 里做：延后 50 ms、防抖，
 # 连续确认只算最后一次；操作本身零等待，路径下一帧之后自己跟上。
-_MPATH_Q = {"rig": "", "timer": False}
+_MPATH_Q = {"rig": "", "timer": False, "defer": 0}
+
+# v5.2.39：最近一次模态事件的时间戳。timer 会在模态事件之间插进来执行，而
+# pose.paths_update() 是 154~161 ms 的同步全量重算（420 骨 / 219 根路径实测），
+# 一旦落在拖拽中途，事件循环就冻结那 160 ms；松手后攒下的鼠标位移作为**一个**
+# MOUSEMOVE 喂进来，就是用户说的「卡一下、然后姿态猛跳一段」。
+# 拖拽期间一律不刷，等手停下来再做。
+_GESTURE_T = 0.0
+MPATH_IDLE_SECONDS = 0.30      # 手停多久之后才允许刷路径
+MPATH_DEFER_LIMIT = 80         # 最多让 80 × 0.2 s = 16 s，之后照算，别饿死
 
 
 def _mpath_ctx_kw(rig):
@@ -313,6 +338,13 @@ def _mpath_redraw():
 
 
 def _mpath_timer_tick():
+    # v5.2.39：拖拽期间不许插进来（见 _GESTURE_T 的注释）。用返回间隔自我
+    # 重排，不重复 register —— 重复注册会让同一个回调进队列两次。
+    if (time.perf_counter() - _GESTURE_T) < MPATH_IDLE_SECONDS:
+        _MPATH_Q["defer"] = int(_MPATH_Q.get("defer", 0)) + 1
+        if _MPATH_Q["defer"] <= MPATH_DEFER_LIMIT:
+            return 0.20
+    _MPATH_Q["defer"] = 0
     _MPATH_Q["timer"] = False
     name = _MPATH_Q["rig"]
     _MPATH_Q["rig"] = ""
@@ -7781,6 +7813,15 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
 
     RIM_TILT = 0.5        # |A·n| ≥ 它：圆环基本正对镜头，用轮缘式
     RIM_MIN_PX = 26.0     # 指针离枢轴小于它时方位角没意义，先不动
+    # v5.2.39：单个事件允许的最大位移（px）与单轴 RIM 单帧最大方位角增量（°）。
+    # 都按「人手一个事件周期内物理上能移动多少」封顶：位移 60~90 px/帧已是
+    # 极快拖动，180 留足余量；方位角 25°/帧 相当于 1500°/s，正常拖拽碰不到。
+    # 超过就说明事件循环被卡过、这是攒出来的，截断比整段吃掉更接近用户意图。
+    DRAG_STEP_MAX = 180.0
+    RIM_STEP_MAX_DEG = 25.0
+    # 自由旋转 / 双轴 / 投影式单轴：单个事件最多转过多少度。正常拖拽 1~10°，
+    # 30° 相当于 1800°/s，人手碰不到；事件被卡过之后攒出来的位移会撞上它。
+    STEP_MAX_DEG = 30.0
 
     def _single_axis_setup(self, context):
         """算一次单轴拖动的方向映射，整段手势都用这一份（v4.9.99）。
@@ -7867,6 +7908,13 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
             d = phi - self._s_phi
             d = (d + 180.0) % 360.0 - 180.0        # 归到 (-180, 180]，可绕多圈
             self._s_phi = phi
+            # v5.2.39：单帧方位角突变限幅。事件循环被卡过时指针会「瞬移」，
+            # 方位角随之猛跳 —— 限幅之后姿态最多前进 25°，不再整段飞出去。
+            cap_rim = getattr(self, 'RIM_STEP_MAX_DEG', 25.0)
+            if d > cap_rim:
+                d = cap_rim
+            elif d < -cap_rim:
+                d = -cap_rim
             self._rim_acc += d * factor
             self._ang_h = self._rim_acc * self._s_sign
             return
@@ -7874,7 +7922,14 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
         if u is None:
             return
         # u 是屏幕上「y 向上」的 2D 方向
-        self._ang_h += (dx * u.x + dyu * u.y) * sens
+        add = (dx * u.x + dyu * u.y) * sens
+        # v5.2.39：单帧转角限幅，同上
+        cap = getattr(self, 'STEP_MAX_DEG', 30.0)
+        if add > cap:
+            add = cap
+        elif add < -cap:
+            add = -cap
+        self._ang_h += add
 
     def _confine_cursor(self, context, event):
         """把指针夹在控制器周围的活动半径内 —— 自由 / 双轴 / 投影式单轴都走这里。
@@ -7948,16 +8003,41 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
         region, rv3d = _view_pair(context)
         if region is None or rv3d is None:
             return
+        base_x, base_y = self._track_dx, self._track_dy
         self._track_dx += dx * factor
         self._track_dy += dy * factor
         right, up = _view_axes(rv3d)
-        ang_h = math.radians(self._native_curve_deg(self._track_dx))
-        ang_v = math.radians(self._native_curve_deg(self._track_dy))
-        delta = (Quaternion(up, ang_h) @ Quaternion(right, ang_v))
+
+        def _q(sx, sy):
+            return (Quaternion(up, math.radians(self._native_curve_deg(sx)))
+                    @ Quaternion(right, math.radians(self._native_curve_deg(sy)))
+                    @ self._quat0)
+
+        q_new = _q(self._track_dx, self._track_dy)
+        # v5.2.39：单帧转角限幅。事件循环被卡过（路径重算、撤销、大重估）时，
+        # 恢复后的第一个事件带的是攒下的位移；而这条角度曲线在原点附近最陡
+        # （1 px ≈ 1°），180 px 就能给出 120° —— 像素上限在这里挡不住。
+        # 按「这一段最多转多少度」二分回缩累计位移：正常拖动 1~10°/帧，碰不到。
+        if self._quat is not None:
+            step = math.degrees((self._quat.inverted() @ q_new).angle)
+            cap_deg = getattr(self, 'STEP_MAX_DEG', 30.0)
+            if step > cap_deg:
+                lo, hi = 0.0, 1.0
+                for _ in range(9):
+                    mid = (lo + hi) * 0.5
+                    qm = _q(base_x + (self._track_dx - base_x) * mid,
+                            base_y + (self._track_dy - base_y) * mid)
+                    if math.degrees((self._quat.inverted() @ qm).angle) > cap_deg:
+                        hi = mid
+                    else:
+                        lo = mid
+                self._track_dx = base_x + (self._track_dx - base_x) * lo
+                self._track_dy = base_y + (self._track_dy - base_y) * lo
+                q_new = _q(self._track_dx, self._track_dy)
         # 转完视角时会把当时的旋转冻结进 _quat0，并把 _track_dx/dy 归零。
         # 直接在 _quat0 之上叠这一段的增量 —— 否则累计位移会被当前视角的
         # right/up 重新解释一遍，姿态瞬间跳到完全不同的方向（剧烈扭动）。
-        self._quat = delta @ self._quat0
+        self._quat = q_new
 
     # ---- 灵敏度 / 指针回绕
 
@@ -8546,6 +8626,10 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
             return {'CANCELLED'}
 
     def _modal(self, context, event):
+        # v5.2.39：记下「手还在动」。异步路径刷新靠这个时间戳判断能不能开跑，
+        # 详见 _GESTURE_T 处的注释。
+        global _GESTURE_T
+        _GESTURE_T = time.perf_counter()
         et = event.type
         # 中键单击 = 清旋转；移动超过 4px 才转交给转视角
         if (self._mmb_click is not None
@@ -8629,6 +8713,19 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
                     return {'RUNNING_MODAL'}
             self._moved_any = True
 
+            # v5.2.39：拖拽中途的「补一刀」守卫。事件循环被卡过（路径全量重算、
+            # 撤销、大 depsgraph 重估、定时器）时，恢复后的**第一个** MOUSEMOVE
+            # 带的是这段时间攒下的总位移 —— 一次吃进去就是「卡一下、姿态猛跳
+            # 一段」。人手一帧最多也就 60~90 px（2000 px/s @ 30fps），超过
+            # DRAG_STEP_MAX 的部分一律按上限截断，剩下的丢弃（参考点已经对齐
+            # 到当前指针，下一帧正常跟手）。单轴 RIM 的方向在 step 里单独限幅。
+            span = math.hypot(dx, dy)
+            cap_px = getattr(self, 'DRAG_STEP_MAX', 180.0)
+            if span > cap_px:
+                k = cap_px / span
+                dx *= k
+                dy *= k
+
             # 吸附档：Ctrl = 偏好里的角度（trackball 不吸附，没有单一角度可吸）
             if event.ctrl and self._kind == 'ROT' and self._mode != 'TRACKBALL':
                 self._snap_step = 15.0 if event.shift else float(pref('snap_deg', 5) or 5)
@@ -8670,8 +8767,14 @@ class POSE_OT_cn_quick_rotate_v45(bpy.types.Operator):
                 # 两个通道各吃各的位移分量，一次拖动可以同时调两个轴
                 uh = self._dir_win.get(self._ax_h)
                 uv = self._dir_win.get(self._ax_v)
-                self._ang_h += dx * sens * (1.0 if uh is None or uh.x >= 0 else -1.0)
-                self._ang_v += dy * sens * (1.0 if uv is None or uv.y >= 0 else -1.0)
+                dh = dx * sens * (1.0 if uh is None or uh.x >= 0 else -1.0)
+                dv = dy * sens * (1.0 if uv is None or uv.y >= 0 else -1.0)
+                # v5.2.39：单帧转角限幅（事件被卡过时 dx 是攒出来的）
+                cap = getattr(self, 'STEP_MAX_DEG', 30.0)
+                dh = cap if dh > cap else (-cap if dh < -cap else dh)
+                dv = cap if dv > cap else (-cap if dv < -cap else dv)
+                self._ang_h += dh
+                self._ang_v += dv
             else:
                 # 单轴：环绕式（绕枢轴画圈 1:1 跟手），拿不到枢轴时退回投影式
                 self._single_axis_step(context, event, dx, dy, factor)
