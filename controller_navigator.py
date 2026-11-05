@@ -185,7 +185,7 @@
 bl_info = {
     "name": "驭骨 · BonePilot",
     "author": "默尔佐",
-    "version": (5, 2, 41),
+    "version": (5, 2, 42),
     "blender": (5, 2, 0),
     "location": "Pose Mode > N 面板 > Nav",
     "description": "驭骨 · BonePilot：按集合导航控制器，快速旋转/移动，逐段撤销，让动画操作跟手",
@@ -5048,17 +5048,17 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
         self._slots = []
         self._names = []
         self._handle = None
-        # v5.2.40 多部位独显：已锁格（有序）、开饼前的星标快照、扫过沿、累加态
+        # v5.2.42：C3 语义 —— **不按任何键**。
+        #   扫一颗 = 只独显这一颗（替换，和 v5.2.39 以前完全一致）；
+        #   扫多颗 = 开饼时已有的星 ∪ 本次扫过的（累加）。
+        #   之所以彻底不用修饰键：饼本身是 Alt+左键 / Alt+Shift+左键 触发的，
+        #   任何修饰键都可能既是触发键又是模式键 —— 细节饼因此永远退不出累加态。
         self._last = (event.mouse_region_x, event.mouse_region_y)
         self._last_r = 0.0           # 上一帧离饼心的半径（判断是否从内圈重新瞄准）
-        self._locks = []
-        self._snap = []
+        self._locks = []             # 本次扫过的格（有序）
+        self._snap = []              # 开饼前已有的星标（名字）
+        self._snap_slots = []        # 上面那些星在本层的格位（只用于画灰星）
         self._sweep = -1
-        # ★ 只认 Shift。饼本身就是 Alt+左键触发的 —— 把 ctrl/alt 也算进来的话，
-        #   invoke 时 event.alt 恒为真，一开饼就直接进累加态（用户实测：
-        #   「还没按住 Shift，功能就被调出来了」）。
-        self._accum = bool(event.shift)
-        self._preview_slot = -1      # 非累加态的星标预览（不写 _locks）
         self._applied = None         # 上一次真正落场景的集合组合，用来去重
         self._rcache = {}
         self._load_slots(context)
@@ -5072,9 +5072,12 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
             except Exception:
                 self._snap = []
             if self._snap:
-                # 已有星标先落成锁位 —— 累加建在现有基础上（先独显 A，再 Shift 加 B）
-                self._locks = self._locks_from_snap(rig0)
-                self._sweep = self._locks[-1] if self._locks else -1
+                # 只在画面上标出来（灰星 = 当前独显、但不是本次选中的），
+                # **不参与本次选中集** —— 否则「单颗 = 替换」就退化成累加了
+                want = set(self._snap)
+                for i in range(8):
+                    if self._names[i] and self._resolved(i, rig0) in want:
+                        self._snap_slots.append(i)
         try:
             self._handle = bpy.types.SpaceView3D.draw_handler_add(
                 self._draw, (), 'WINDOW', 'POST_PIXEL')
@@ -5127,34 +5130,28 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 out.append(nm)
         return out
 
-    def _locks_from_snap(self, rig):
-        """把开饼前已有的星标反查成格位，让累加建在现有基础上。"""
-        want = set(self._snap or [])
-        out = []
-        seen = set()
-        for i in range(8):
-            if not self._names[i]:
-                continue
-            nm = self._resolved(i, rig)
-            if nm in want and nm not in seen:
-                seen.add(nm)
-                out.append(i)
-        return out
+    def _commit_names(self, rig):
+        """C3：本次扫过的格决定最终结果。
 
-    def _current_names(self, rig):
-        """当前该独显哪些集合：显式锁优先，其次单格预览。"""
-        if self._locks:
-            return self._lock_names(rig)
-        if self._preview_slot >= 0:
-            nm = self._resolved(self._preview_slot, rig)
-            return [nm] if nm else []
-        return []
+        扫一颗 → 只独显这一颗（替换；老行为一字不变）；
+        扫多颗 → 开饼时已有的星 ∪ 本次扫过的（累加）。
+        「扫过」是加法，「单颗」是替换 —— 这样既能顺手加一块，也不会
+        因为开饼时本来就有星，就把「只想看这一个」变成「全留下来」。
+        """
+        locked = self._lock_names(rig)
+        if len(locked) <= 1:
+            return locked
+        out = []
+        for nm in list(self._snap or []) + locked:
+            if nm and nm not in out:
+                out.append(nm)
+        return out
 
     def _apply_preview(self, rig):
         """落场景（不写键）。同一组集合不重复写，省得每帧刷可见性。"""
         if rig is None:
             return
-        names = self._current_names(rig)
+        names = self._commit_names(rig)
         key = tuple(names)
         if key == self._applied:
             return
@@ -5225,15 +5222,18 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 shader.uniform_float("color", (0.24, 0.40, 0.68, 0.55))
                 wb.draw(shader)
             locks = getattr(self, "_locks", [])
+            snap_slots = getattr(self, "_snap_slots", [])
             for i in range(8):
                 mid = math.radians(90.0 - i * 45.0)
                 a0, a1 = mid - math.radians(22.5), mid + math.radians(22.5)
                 locked = i in locks
+                # 开饼时就独显、但本次没扫到 —— 灰金色，提示「松手它会掉」
+                kept = (i in snap_slots) and not locked
                 if locked:
                     col = ((0.60, 0.44, 0.10, 0.96) if i == self._hover
                            else (0.46, 0.34, 0.09, 0.96))
-                elif i == self._star_hover and not locks:
-                    col = (0.42, 0.34, 0.12, 0.96)
+                elif kept:
+                    col = (0.26, 0.21, 0.11, 0.94)
                 elif i == self._hover:
                     col = (0.24, 0.40, 0.68, 0.96)
                 else:
@@ -5252,8 +5252,8 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 sb = batch_for_shader(shader, 'TRIS', {"pos": star})
                 if locked:
                     sc = (1.0, 0.86, 0.42, 1.0)
-                elif i == self._star_hover and not locks:
-                    sc = (1.0, 0.80, 0.28, 1.0)
+                elif kept:
+                    sc = (0.80, 0.64, 0.30, 0.95)
                 else:
                     sc = (0.66, 0.66, 0.70, 1.0)
                 shader.bind()
@@ -5265,6 +5265,8 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 blf.size(0, geo["font"])
                 if locked:
                     blf.color(0, 1.0, 0.93, 0.74, 1.0)
+                elif kept:
+                    blf.color(0, 0.86, 0.80, 0.66, 1.0)
                 else:
                     blf.color(0, 0.92, 0.93, 0.95, 1.0)
                 tx = cx + (r_in + r_out) * 0.5 * math.cos(mid)
@@ -5297,7 +5299,7 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
         return
 
     def _commit(self, context):
-        """定格多选独显（累加会话的收尾）。"""
+        """定格本次扫选（C3 收尾）。"""
         self._end(context)
         try:
             rig = pie_rig(context)
@@ -5305,13 +5307,14 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
             rig = None
         if rig is None:
             return {'FINISHED'}
-        names = self._lock_names(rig)
+        names = self._commit_names(rig)
         if not names:
             self._restore_snap(rig)
             return {'FINISHED'}
         try:
             if sorted(names) == sorted(self._snap):
                 # 和开饼前一模一样 → 按「再点一次还原」处理，别留一个空动作
+                # （单颗扫过已经独显的那一格 = 关掉它，老肌肉记忆还在）
                 solo_clear(rig)
             else:
                 solo_set(rig, names, commit=True)
@@ -5319,24 +5322,10 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
             pass
         self._locks = []
         self._preview = None
-        self._preview_slot = -1
         return {'FINISHED'}
 
     def modal(self, context, event):
         try:
-            # 修饰键：**只认 Shift**（Ctrl/Alt 是饼自己的触发键，不能当开关）
-            if event.type in {'LEFT_SHIFT', 'RIGHT_SHIFT'}:
-                if event.value == 'PRESS':
-                    self._accum = True
-                    self._sweep = self._star_hover
-                else:
-                    # 松开 Shift 就退出累加态，已锁的照样留着；
-                    # 之后不再响应悬停，避免「松了手还能被误锁」
-                    self._accum = False
-                    self._sweep = -1
-                if context.area is not None:
-                    context.area.tag_redraw()
-                return {'RUNNING_MODAL'}
             if event.type == 'MOUSEMOVE':
                 mx, my = event.mouse_region_x, event.mouse_region_y
                 geo = _wheel_geo()
@@ -5346,45 +5335,37 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 idx, r = _wheel_sector(mx, my, self._center[0], self._center[1])
                 self._last_r = r
                 self._r = r
+                star_r = _wheel_star_r(geo)
                 r_max = geo["r_out"] + geo["gap"] + geo["star_r"] + 12
                 if r < geo["dead"] or r > r_max:
                     idx = -1            # 中心死区 / 拖太远 = 不选
                 # ★ 只有**外圈星标环带**才算命中；扇区身上一律不算。
                 #   用户实测：刚开饼挪一下鼠标就被独显，太灵敏。
-                star = idx if (idx >= 0 and r >= _wheel_star_r(geo)) else -1
+                star = idx if (idx >= 0 and r >= star_r) else -1
                 changed = (idx != self._hover) or (star != self._star_hover)
                 self._hover, self._star_hover = idx, star
                 try:
                     rig = pie_rig(context)
                 except Exception:
                     rig = None
-                if event.shift and not self._accum:
-                    self._accum = True
-                if self._accum:
-                    # 多部位独显：只认星标环带，沿轨迹补采样防漏格
-                    if rig is not None and star >= 0:
-                        # 上一帧还在内圈 = 重新瞄准，这一把只加不减，
-                        # 免得手抖移出去再移回同一格就把锁解了
-                        add_only = prev_r < _wheel_star_r(geo)
-                        for s in _wheel_sweep(px, py, mx, my,
-                                              self._center[0], self._center[1],
-                                              geo, self._sweep, star_only=True):
-                            if self._toggle_lock(s, rig, add_only):
-                                changed = True
-                    # star=-1（还在内圈）时不动 _sweep —— 内圈是安全区，
-                    # 挪出去再挪回来不该把刚锁的格又解掉
-                    if star >= 0:
-                        self._sweep = star
-                elif not self._locks:
-                    # 老行为：滑到外圈星星 = 预览独显这一格，滑回 = 退掉。
-                    # 预览单独记在 _preview_slot，不写 _locks —— 否则中心会
-                    # 跳出「1」，看着像已经锁定了。
-                    if star != self._preview_slot:
-                        self._preview_slot = star
-                        self._apply_preview(rig)
-                        changed = True
-                elif self._preview_slot >= 0:
-                    self._preview_slot = -1
+                if r < geo["dead"] and self._locks:
+                    # 收回中心孔 = 清空本次选中。这是唯一的「反悔」手势，
+                    # 不用按任何键；手停在中心孔里松手也等于什么都没选。
+                    self._locks = []
+                    self._sweep = -1
+                    self._apply_preview(rig)
+                    changed = True
+                if rig is not None and star >= 0:
+                    # 沿轨迹补采样防漏格（一帧跨两三格很常见）。
+                    # 上一帧还在内圈 = 重新瞄准，这一把只加不减，免得手抖
+                    # 移出去再移回同一格就把锁解了；沿着星标环再划回来才是撤销。
+                    add_only = prev_r < star_r
+                    for s in _wheel_sweep(px, py, mx, my,
+                                          self._center[0], self._center[1],
+                                          geo, self._sweep, star_only=True):
+                        if self._toggle_lock(s, rig, add_only):
+                            changed = True
+                    self._sweep = star
                 if changed and context.area is not None:
                     context.area.tag_redraw()
                 return {'RUNNING_MODAL'}
@@ -5397,7 +5378,6 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                     pass
                 self._locks = []
                 self._preview = None
-                self._preview_slot = -1
                 self._sweep = -1
                 self._rcache = {}
                 nxt = self.layer + (1 if event.type == 'WHEELUPMOUSE' else -1)
@@ -5416,30 +5396,12 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
             if event.type == 'LEFTMOUSE':
                 if event.value == 'PRESS':
                     return {'RUNNING_MODAL'}
-                # 有锁 = 累加会话收尾（Shift 扫选一律走这条）
+                # 扫过星标 = 本次选中，直接按 C3 规则定格
                 if self._locks:
                     return self._commit(context)
-                star, hover = self._star_hover, self._hover
-                name = self._names[star] if 0 <= star < len(self._names) else ""
+                hover = self._hover
                 self._end(context)
                 rig = pie_rig(context)
-                if rig is not None and name:
-                    # v5.2.27：星标落定同样只独显当前 IK/FK 态那套
-                    name = _resolve_mode_collection(rig, name)
-                if rig is not None and star >= 0 and name:
-                    # 松手在星星上 = 独显定格；开饼前就已独显这格 → 还原
-                    if solo_names(rig) == [name]:
-                        solo_clear(rig)
-                    else:
-                        solo_set(rig, [name], commit=True)
-                    self._preview = None
-                    self._preview_slot = -1
-                    return {'FINISHED'}
-                if rig is not None and self._preview_slot >= 0:
-                    # 从星星滑回扇区后松手 = 先退预览，再按老逻辑走
-                    self._restore_snap(rig)
-                    self._preview_slot = -1
-                    self._preview = None
                 if rig is not None and hover >= 0:
                     nm = self._names[hover] if hover < len(self._names) else ""
                     if nm:
@@ -5456,7 +5418,6 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                     pass
                 self._locks = []
                 self._preview = None
-                self._preview_slot = -1
                 return {'CANCELLED'}
         except Exception:
             try:
