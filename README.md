@@ -4,17 +4,17 @@ Blender 插件：按集合导航控制器，快速旋转/移动，逐段撤销�
 
 面向 **Blender 5.2+**（Rigify / AniMate / ARP 类骨架均可使用）。
 
-当前版本：**v5.2.40**（2026-11-05）
+当前版本：**v5.2.41**（2026-11-05）
 
 ## 下载
 
-- **安装包（推荐）**：[Releases → 最新版](https://github.com/dazuoge/yugu-bonepilot/releases/latest)，文件名 `yugu-bonepilot-v5.2.40.zip`
-- **单文件**：[`controller_navigator.py`](controller_navigator.py)（与安装包内文件逐字节一致，md5 `8a3ad7c9c844979762e42e91a07f66d5`）
+- **安装包（推荐）**：[Releases → 最新版](https://github.com/dazuoge/yugu-bonepilot/releases/latest)，文件名 `yugu-bonepilot-v5.2.41.zip`
+- **单文件**：[`controller_navigator.py`](controller_navigator.py)（与安装包内文件逐字节一致，md5 `f6706614c09ff70380e95f75634f0ce7`）
 
 ## 安装
 
 1. Blender → `Edit → Preferences → Add-ons` → 右上角 `⌄` → **Install from Disk…**
-2. 选 `yugu-bonepilot-v5.2.40.zip`（或直接选 `controller_navigator.py`）
+2. 选 `yugu-bonepilot-v5.2.41.zip`（或直接选 `controller_navigator.py`）
 3. 勾选启用「驭骨 · BonePilot」
 4. 已经装过旧版的：覆盖后按 `F3 → Reload Scripts`，或重启 Blender —— 否则跑的还是内存里的旧代码
 
