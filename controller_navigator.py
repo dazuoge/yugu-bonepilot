@@ -185,7 +185,7 @@
 bl_info = {
     "name": "驭骨 · BonePilot",
     "author": "默尔佐",
-    "version": (5, 2, 39),
+    "version": (5, 2, 40),
     "blender": (5, 2, 0),
     "location": "Pose Mode > N 面板 > Nav",
     "description": "驭骨 · BonePilot：按集合导航控制器，快速旋转/移动，逐段撤销，让动画操作跟手",
@@ -4712,14 +4712,33 @@ class POSE_OT_cn_first_bone_v45(bpy.types.Operator):
 # 所以「关掉再打开文件」也能还原回你原来的显示状态。
 
 _SOLO_COL_KEY = "cn_solo_col"
+_SOLO_COLS_KEY = "cn_solo_cols"      # v5.2.40：多集合独显（| 分隔，第一个是主控）
 _SOLO_PREV_KEY = "cn_solo_prev"
 
 
 def solo_collection_name(rig):
+    """主控集合名（多选时是第一个）—— 老判断靠它，保持单值语义。"""
     try:
         return str(rig.data.get(_SOLO_COL_KEY, "") or "")
     except Exception:
         return ""
+
+
+def solo_names(rig):
+    """当前独显的集合名列表（保序）。新键优先，旧单值键兜底。
+
+    Blender 原生骨骼集合的 is_solo 本来就是**并集**语义（实测 5.2.3：
+    两个集合同时打星 → 两组骨骼都可见、其余全隐），所以多部位独显
+    不需要自己算可见性，只要把星打在一组集合上。
+    """
+    try:
+        raw = str(rig.data.get(_SOLO_COLS_KEY, "") or "")
+    except Exception:
+        raw = ""
+    if raw:
+        return [n for n in raw.split("|") if n]
+    one = solo_collection_name(rig)
+    return [one] if one else []
 
 
 def solo_tree(col):
@@ -4735,20 +4754,27 @@ def solo_tree(col):
     return out
 
 
-def solo_apply(rig, col_name, commit=False):
-    """原生独显：给集合打 is_solo 星标（和骨骼集合面板的 ★ 是同一个开关）。
+def solo_set(rig, names, commit=False):
+    """多集合独显：把 names（集合名列表）**连同各自子集合**一起打星。
 
-    好处：**一个集合的 is_visible 都不动** —— 以前是把其他集合逐个
-    is_visible=False、还原时靠自己的快照写回去；现在走 Blender 原生
-    solo，取消星标后可见性由 Blender 自动还原，侧栏面板上也能直接
-    看到星标亮在哪。范围保持旧语义：目标集合 + 全部子集合一起标星
-    （Hair 这类 0 骨分组、以及 Rigify 分层，纯原生只标自己会
-    「一颗星下去什么都看不见」）。
+    原生 solo：一个集合的 is_visible 都不动 —— 取消星标后可见性由
+    Blender 自动还原，侧栏面板上也能直接看到星标亮在哪。范围保持旧
+    语义：每个目标集合 + 全部子集合一起标星（Hair 这类 0 骨分组、
+    以及 Rigify 分层，纯原生只标自己会「一颗星下去什么都看不见」）。
+
+    names 传空列表 = 清空独显。
     """
-    col = _coll_get(rig, col_name) if col_name else None
-    if col is None:
+    if isinstance(names, str):
+        names = [names]
+    names = [n for n in (names or []) if n]
+    keep = set()
+    for n in names:
+        col = _coll_get(rig, n)
+        if col is None:
+            continue
+        keep |= set(c.name for c in solo_tree(col))
+    if names and not keep:
         return False
-    keep = set(c.name for c in solo_tree(col))
     try:
         for c in _colls(rig):
             want = c.name in keep
@@ -4758,10 +4784,21 @@ def solo_apply(rig, col_name, commit=False):
         return False
     if commit:
         try:
-            rig.data[_SOLO_COL_KEY] = col_name
+            if names:
+                rig.data[_SOLO_COLS_KEY] = "|".join(names)
+                rig.data[_SOLO_COL_KEY] = names[0]
+            else:
+                for k in (_SOLO_COLS_KEY, _SOLO_COL_KEY):
+                    if k in rig.data:
+                        del rig.data[k]
         except Exception:
             pass
     return True
+
+
+def solo_apply(rig, col_name, commit=False):
+    """单集合入口（老签名）——内部转到 solo_set，参数也接受列表。"""
+    return solo_set(rig, col_name, commit)
 
 
 def solo_clear(rig, restore=True):
@@ -4774,7 +4811,7 @@ def solo_clear(rig, restore=True):
     except Exception:
         pass
     # 老版本把可见性快照存在 data 里，顺手清掉历史残留
-    for k in (_SOLO_PREV_KEY, _SOLO_COL_KEY):
+    for k in (_SOLO_PREV_KEY, _SOLO_COL_KEY, _SOLO_COLS_KEY):
         try:
             if k in rig.data:
                 del rig.data[k]
@@ -4787,7 +4824,7 @@ def solo_toggle(rig, col_name, report=None):
     """点一下只显示这个集合，再点一下（或点别的集合）还原 / 换一个。"""
     if not col_name:
         return ""
-    if solo_collection_name(rig) == col_name:
+    if solo_names(rig) == [col_name]:
         solo_clear(rig)
         return "restore"
     solo_apply(rig, col_name, commit=True)
@@ -4868,6 +4905,62 @@ def _wheel_sector(mx, my, cx, cy, count=8):
     return idx, r
 
 
+def _wheel_slot_polar(cx, cy, ang_deg, r, geo):
+    """极坐标反推扇区号；不在有效环带内返回 -1（与 modal 的判定同源）。"""
+    if r < geo["dead"]:
+        return -1
+    if r > geo["r_out"] + geo["gap"] + geo["star_r"] + 12:
+        return -1
+    idx = int(round((90.0 - ang_deg) / 45.0)) % 8
+    return idx
+
+
+def _wheel_sweep(ax, ay, bx, by, cx, cy, geo, last=-1):
+    """两点之间「扫过」的扇区序列（不含起点所在格，相邻不重复）。
+
+    为什么需要它：modal 拿到的 MOUSEMOVE 是离散的，快速划动一帧能跨过
+    两三个格子；直接按当前帧所在扇区判断，表现就是「扫过三个只锁到一个」。
+    这里按角度插值补采样（7.5° 一步）。
+
+    两种情形不插值：
+      · 任一端落在死区里 —— 从中心往外划，本来就没「扫过」这回事；
+      · 两点连线穿过中心孔 —— 那是「从 A 直拉到 B」，不是沿弧扫过，
+        插值会把中间两格也锁上。
+    """
+    dx0, dy0 = ax - cx, ay - cy
+    dx1, dy1 = bx - cx, by - cy
+    r0 = math.hypot(dx0, dy0)
+    r1 = math.hypot(dx1, dy1)
+    a0 = math.degrees(math.atan2(dy0, dx0))
+    a1 = math.degrees(math.atan2(dy1, dx1))
+
+    def _one(ang, rad):
+        s = _wheel_slot_polar(cx, cy, ang, rad, geo)
+        return [s] if s >= 0 else []
+
+    if r0 < geo["dead"] or r1 < geo["dead"]:
+        return _one(a1, r1)
+    seg = math.hypot(bx - ax, by - ay)
+    if seg > 1e-6:
+        d = abs((bx - ax) * (ay - cy) - (by - ay) * (ax - cx)) / seg
+        if d < geo["dead"] * 0.9:
+            return _one(a1, r1)
+
+    da = (a1 - a0 + 180.0) % 360.0 - 180.0
+    n = int(abs(da) / 7.5) + 1
+    if n > 48:
+        n = 48
+    out = []
+    for k in range(1, n + 1):
+        t = k / float(n)
+        s = _wheel_slot_polar(cx, cy, a0 + da * t, r0 + (r1 - r0) * t, geo)
+        if s < 0 or s == last:
+            continue
+        out.append(s)
+        last = s
+    return out
+
+
 def _sector_tris(cx, cy, a0, a1, r0, r1, seg=8):
     out = []
     for k in range(seg):
@@ -4936,7 +5029,28 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
         self._slots = []
         self._names = []
         self._handle = None
+        # v5.2.40 多部位独显：已锁格（有序）、开饼前的星标快照、扫过沿、累加态
+        self._last = (event.mouse_region_x, event.mouse_region_y)
+        self._locks = []
+        self._snap = []
+        self._sweep = -1
+        self._accum = bool(event.shift or event.ctrl or event.alt)
+        self._clicked = False
+        self._rcache = {}
         self._load_slots(context)
+        try:
+            rig0 = pie_rig(context)
+        except Exception:
+            rig0 = None
+        if rig0 is not None:
+            try:
+                self._snap = solo_names(rig0)
+            except Exception:
+                self._snap = []
+            if self._snap:
+                # 已有星标先落成锁位 —— 累加建在现有基础上（先独显 A，再 Shift 加 B）
+                self._locks = self._locks_from_snap(rig0)
+                self._sweep = self._locks[-1] if self._locks else -1
         try:
             self._handle = bpy.types.SpaceView3D.draw_handler_add(
                 self._draw, (), 'WINDOW', 'POST_PIXEL')
@@ -4960,6 +5074,89 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
             name = grp[0] if grp else ""
             self._names.append(name)
             self._slots.append(name)
+
+    # ---- v5.2.40：多部位独显 -------------------------------------------------
+    def _resolved(self, slot, rig):
+        """格子名 → 当前 IK/FK 态下**实际显示**的集合名（带缓存）。
+
+        每帧都对 8 格调 _resolve_mode_collection 会遍历骨骼名，首次开饼
+        就掉十几毫秒；格子在整个模态里不变，缓存一次即可。
+        """
+        if slot in self._rcache:
+            return self._rcache[slot]
+        nm = self._names[slot] if 0 <= slot < len(self._names) else ""
+        if not nm or rig is None:
+            self._rcache[slot] = ""
+            return ""
+        try:
+            pv = _resolve_mode_collection(rig, nm)
+        except Exception:
+            pv = nm
+        self._rcache[slot] = pv or ""
+        return self._rcache[slot]
+
+    def _lock_names(self, rig):
+        out = []
+        for s in self._locks:
+            nm = self._resolved(s, rig)
+            if nm and nm not in out:
+                out.append(nm)
+        return out
+
+    def _locks_from_snap(self, rig):
+        """把开饼前已有的星标反查成格位，让累加建在现有基础上。"""
+        want = set(self._snap or [])
+        out = []
+        seen = set()
+        for i in range(8):
+            if not self._names[i]:
+                continue
+            nm = self._resolved(i, rig)
+            if nm in want and nm not in seen:
+                seen.add(nm)
+                out.append(i)
+        return out
+
+    def _apply_locks(self, rig):
+        """把「已锁格」翻译成集合并集，落到场景（预览，不写键）。"""
+        if rig is None:
+            return
+        names = self._lock_names(rig)
+        try:
+            if names:
+                solo_set(rig, names, commit=False)
+            else:
+                solo_set(rig, self._snap, commit=False)
+        except Exception:
+            return
+        self._preview = "|".join(names) if names else None
+
+    def _toggle_lock(self, slot, rig):
+        """划进一格就切换它的锁（累加模式的核心语义）。"""
+        if slot < 0 or slot >= 8 or not self._names[slot]:
+            return False
+        if slot in self._locks:
+            self._locks.remove(slot)
+        else:
+            # 同一个集合可能占了两格（自动布局会重复），锁新的就把旧的让出来，
+            # 否则中心计数和实际独显的集合数对不上
+            nm = self._resolved(slot, rig)
+            if nm:
+                for other in list(self._locks):
+                    if self._resolved(other, rig) == nm:
+                        self._locks.remove(other)
+            self._locks.append(slot)
+        self._apply_locks(rig)
+        return True
+
+    def _restore_snap(self, rig):
+        """退出时按开饼前的星标恢复 —— 预览过再 ESC 也不会把原来的星弄丢。"""
+        if rig is None:
+            return
+        try:
+            solo_set(rig, self._snap, commit=False)
+        except Exception:
+            pass
 
     def _draw(self):
         try:
@@ -4987,10 +5184,15 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 shader.bind()
                 shader.uniform_float("color", (0.24, 0.40, 0.68, 0.55))
                 wb.draw(shader)
+            locks = getattr(self, "_locks", [])
             for i in range(8):
                 mid = math.radians(90.0 - i * 45.0)
                 a0, a1 = mid - math.radians(22.5), mid + math.radians(22.5)
-                if i == self._star_hover:
+                locked = i in locks
+                if locked:
+                    col = ((0.60, 0.44, 0.10, 0.96) if i == self._hover
+                           else (0.46, 0.34, 0.09, 0.96))
+                elif i == self._star_hover:
                     col = (0.42, 0.34, 0.12, 0.96)
                 elif i == self._hover:
                     col = (0.24, 0.40, 0.68, 0.96)
@@ -5005,10 +5207,15 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                     continue
                 sx = cx + (r_out + geo["gap"]) * math.cos(mid)
                 sy = cy + (r_out + geo["gap"]) * math.sin(mid)
-                star = _star_tris(sx, sy, geo["star_r"], geo["star_r"] * 0.42, 5)
+                sr = geo["star_r"] * (1.35 if locked else 1.0)
+                star = _star_tris(sx, sy, sr, sr * 0.42, 5)
                 sb = batch_for_shader(shader, 'TRIS', {"pos": star})
-                sc = ((1.0, 0.80, 0.28, 1.0) if i == self._star_hover
-                      else (0.66, 0.66, 0.70, 1.0))
+                if locked:
+                    sc = (1.0, 0.86, 0.42, 1.0)
+                elif i == self._star_hover:
+                    sc = (1.0, 0.80, 0.28, 1.0)
+                else:
+                    sc = (0.66, 0.66, 0.70, 1.0)
                 shader.bind()
                 shader.uniform_float("color", sc)
                 sb.draw(shader)
@@ -5016,12 +5223,23 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 if len(txt) > 12:
                     txt = txt[:11] + "…"
                 blf.size(0, geo["font"])
-                blf.color(0, 0.92, 0.93, 0.95, 1.0)
+                if locked:
+                    blf.color(0, 1.0, 0.93, 0.74, 1.0)
+                else:
+                    blf.color(0, 0.92, 0.93, 0.95, 1.0)
                 tx = cx + (r_in + r_out) * 0.5 * math.cos(mid)
                 ty = cy + (r_in + r_out) * 0.5 * math.sin(mid)
                 w, h = blf.dimensions(0, txt)
                 blf.position(0, tx - w * 0.5, ty - h * 0.5, 0)
                 blf.draw(0, txt)
+            if locks:
+                # 中心孔报数：多选时一眼看到锁了几个
+                num = "%d" % len(locks)
+                blf.size(0, max(14, geo["font"] + 6))
+                blf.color(0, 1.0, 0.85, 0.45, 1.0)
+                w, h = blf.dimensions(0, num)
+                blf.position(0, cx - w * 0.5, cy - h * 0.5, 0)
+                blf.draw(0, num)
             gpu.state.blend_set('NONE')
         except Exception:
             try:
@@ -5038,11 +5256,62 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
             self._handle = None
         return
 
+    def _commit(self, context):
+        """定格多选独显（累加会话的收尾）。"""
+        self._end(context)
+        try:
+            rig = pie_rig(context)
+        except Exception:
+            rig = None
+        if rig is None:
+            return {'FINISHED'}
+        names = self._lock_names(rig)
+        if not names:
+            self._restore_snap(rig)
+            return {'FINISHED'}
+        try:
+            if sorted(names) == sorted(self._snap):
+                # 和开饼前一模一样 → 按「再点一次还原」处理，别留一个空动作
+                solo_clear(rig)
+            else:
+                solo_set(rig, names, commit=True)
+        except Exception:
+            pass
+        self._locks = []
+        self._preview = None
+        return {'FINISHED'}
+
     def modal(self, context, event):
         try:
+            # 修饰键：不动鼠标也能立刻进/出累加态；Alt/Ctrl 点选靠它收尾
+            if event.type in {'LEFT_SHIFT', 'RIGHT_SHIFT',
+                              'LEFT_CTRL', 'RIGHT_CTRL',
+                              'LEFT_ALT', 'RIGHT_ALT'}:
+                if event.value == 'PRESS':
+                    self._accum = True
+                    self._sweep = self._hover
+                    if self._hover >= 0:
+                        # 「先滑到 A，再按 Shift 继续扫」—— A 显然要保留
+                        try:
+                            rig = pie_rig(context)
+                        except Exception:
+                            rig = None
+                        if rig is not None:
+                            self._toggle_lock(self._hover, rig)
+                else:
+                    if not self._locks:
+                        self._accum = False
+                        self._sweep = -1
+                    elif self._clicked:
+                        return self._commit(context)
+                if context.area is not None:
+                    context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
             if event.type == 'MOUSEMOVE':
                 mx, my = event.mouse_region_x, event.mouse_region_y
                 geo = _wheel_geo()
+                px, py = self._last
+                self._last = (mx, my)
                 idx, r = _wheel_sector(mx, my, self._center[0], self._center[1])
                 self._r = r
                 # ★ 原生饼手感：给出方向就算选中，不用滑到格子上。
@@ -5054,37 +5323,49 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 star = -1
                 if idx >= 0 and r >= geo["r_out"] - 4:
                     star = idx          # 外圈 = 星标（独显这一格）
-                changed = (idx != self._hover) or (star != self._star_hover)
+                prev_hover = self._hover
+                changed = (idx != prev_hover) or (star != self._star_hover)
                 self._hover, self._star_hover = idx, star
-                # 滑到星星 = 预览独显；滑回格子/中心 = 退出独显（松手才落定）
                 try:
                     rig = pie_rig(context)
                 except Exception:
                     rig = None
-                pv = None
-                if rig is not None and star >= 0:
-                    nm = self._names[star] if star < len(self._names) else ""
-                    if nm:
-                        # v5.2.27：预览也走「当前实际显示的那一套」——
-                        # 视图在 IK 态时悬停 FK 格的星星，不能把藏起来的
-                        # FK 控制器独显出来
-                        pv = _resolve_mode_collection(rig, nm)
-                if pv != self._preview:
-                    try:
-                        if pv:
-                            solo_apply(rig, pv, commit=False)
-                        else:
-                            solo_clear(rig, restore=True)
-                    except Exception:
-                        pass
-                    self._preview = pv
-                    changed = True
+                if event.shift or event.ctrl or event.alt:
+                    if not self._accum:
+                        self._accum = True
+                        self._sweep = prev_hover
+                if self._accum:
+                    # 多部位独显：沿轨迹补采样，进入一格就切换它的锁
+                    if rig is not None:
+                        for s in _wheel_sweep(px, py, mx, my,
+                                              self._center[0], self._center[1],
+                                              geo, self._sweep):
+                            if self._toggle_lock(s, rig):
+                                changed = True
+                        self._sweep = idx
+                else:
+                    # 老行为：滑到星星 = 预览独显这一格，滑回格子/中心 = 退掉
+                    want = []
+                    if rig is not None and star >= 0 and self._names[star]:
+                        want = [star]
+                    if want != self._locks:
+                        self._locks = want
+                        self._apply_locks(rig)
+                        changed = True
                 if changed and context.area is not None:
                     context.area.tag_redraw()
                 return {'RUNNING_MODAL'}
             if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
                 self._end(context)
                 # 换层：直接重开，热键手感一致
+                try:
+                    self._restore_snap(pie_rig(context))
+                except Exception:
+                    pass
+                self._locks = []
+                self._preview = None
+                self._sweep = -1
+                self._rcache = {}
                 nxt = self.layer + (1 if event.type == 'WHEELUPMOUSE' else -1)
                 if nxt < 1:
                     nxt = 3
@@ -5092,10 +5373,30 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                     nxt = 1
                 self.layer = nxt
                 self._load_slots(context)
+                try:
+                    self._handle = bpy.types.SpaceView3D.draw_handler_add(
+                        self._draw, (), 'WINDOW', 'POST_PIXEL')
+                except Exception:
+                    return {'CANCELLED'}
                 return {'RUNNING_MODAL'}
             if event.type == 'LEFTMOUSE':
-                if event.value != 'RELEASE':
+                if event.value == 'PRESS':
+                    # 累加态：点一格锁一格，饼继续开（Alt/Ctrl 精确点选）
+                    if self._accum:
+                        try:
+                            rig = pie_rig(context)
+                        except Exception:
+                            rig = None
+                        if rig is not None and self._hover >= 0:
+                            self._toggle_lock(self._hover, rig)
+                            self._clicked = True
+                            if context.area is not None:
+                                context.area.tag_redraw()
                     return {'RUNNING_MODAL'}
+                if self._accum:
+                    if self._clicked:
+                        return {'RUNNING_MODAL'}   # 点选还没完，等修饰键松开
+                    return self._commit(context)
                 star, hover = self._star_hover, self._hover
                 name = self._names[star] if 0 <= star < len(self._names) else ""
                 self._end(context)
@@ -5105,17 +5406,16 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                     name = _resolve_mode_collection(rig, name)
                 if rig is not None and star >= 0 and name:
                     # 松手在星星上 = 独显定格；开饼前就已独显这格 → 还原
-                    if self._preview == name:
-                        solo_apply(rig, name, commit=True)
-                    elif solo_collection_name(rig) == name:
+                    if solo_names(rig) == [name]:
                         solo_clear(rig)
                     else:
-                        solo_apply(rig, name, commit=True)
+                        solo_set(rig, [name], commit=True)
                     self._preview = None
                     return {'FINISHED'}
-                if rig is not None and self._preview is not None:
-                    # 滑回格子后松手 = 先退出独显，再跳集合
-                    solo_clear(rig, restore=True)
+                if rig is not None and self._locks:
+                    # 滑回格子后松手 = 先退出预览独显，再跳集合
+                    self._restore_snap(rig)
+                    self._locks = []
                     self._preview = None
                 if rig is not None and hover >= 0:
                     nm = self._names[hover] if hover < len(self._names) else ""
@@ -5128,12 +5428,11 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
             if event.type in {'RIGHTMOUSE', 'ESC', 'MIDDLEMOUSE'}:
                 self._end(context)
                 try:
-                    rig = pie_rig(context)
-                    if rig is not None and getattr(self, "_preview", None):
-                        solo_clear(rig, restore=True)
-                        self._preview = None
+                    self._restore_snap(pie_rig(context))
                 except Exception:
                     pass
+                self._locks = []
+                self._preview = None
                 return {'CANCELLED'}
         except Exception:
             try:
@@ -5141,10 +5440,7 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
             except Exception:
                 pass
             try:
-                rig = pie_rig(context)
-                if rig is not None and getattr(self, "_preview", None):
-                    solo_clear(rig, restore=True)
-                    self._preview = None
+                self._restore_snap(pie_rig(context))
             except Exception:
                 pass
             return self._native(context)
@@ -11679,7 +11975,7 @@ class VIEW3D_PT_controller_nav_v45(bpy.types.Panel):
             if cur_col is not None:
                 crow = box.row(align=True)
                 crow.label(text=cur_col.name, icon='COLLECTION_COLOR_01')
-                solo_now = solo_collection_name(rig) == cur_col.name
+                solo_now = cur_col.name in solo_names(rig)
                 sc = crow.operator(
                     "pose.cn_solo_collection_v45", text="独显" if not solo_now else "还原",
                     icon=safe_icon('SOLO_ON') if solo_now else safe_icon('SOLO_OFF'),
@@ -11807,9 +12103,16 @@ class VIEW3D_PT_controller_nav_v45(bpy.types.Panel):
         if prefs is not None:
             # 星标饼：默认开着（用户实测比原生饼顺手）；关了就回原生饼，键位一样
             abox.prop(prefs, "pie_custom", text="饼用星标饼（自绘 · 每格带 ★）")
-        if solo_collection_name(rig):
+        snames = solo_names(rig)
+        if snames:
+            if len(snames) == 1:
+                stxt = snames[0]
+            elif len(snames) <= 3:
+                stxt = " + ".join(snames)
+            else:
+                stxt = "%s 等 %d 个" % (" + ".join(snames[:2]), len(snames))
             srow = abox.row(align=True)
-            srow.label(text="正在独显：%s" % solo_collection_name(rig), icon='SOLO_ON')
+            srow.label(text="正在独显：%s" % stxt, icon='SOLO_ON')
             srow.operator("pose.cn_solo_collection_v45", text="还原", icon='LOOP_BACK').restore = True
         # 饼间互斥会改集合的显示状态（Blender 没有临时的集合隐藏），
         # 那是会写进 .blend 的持久数据 —— 给两个按钮兜住这件事。
@@ -11881,7 +12184,7 @@ class VIEW3D_PT_controller_nav_v45(bpy.types.Panel):
                 opx.append = False
                 # 星标：点一下只显示这个集合（再点一次还原）
                 if name:
-                    solo_now = solo_collection_name(rig) == name
+                    solo_now = name in solo_names(rig)
                     st = row.operator(
                         "pose.cn_solo_collection_v45", text="",
                         icon=safe_icon('SOLO_ON') if solo_now else safe_icon('SOLO_OFF'),
