@@ -185,7 +185,7 @@
 bl_info = {
     "name": "驭骨 · BonePilot",
     "author": "默尔佐",
-    "version": (5, 2, 42),
+    "version": (5, 2, 43),
     "blender": (5, 2, 0),
     "location": "Pose Mode > N 面板 > Nav",
     "description": "驭骨 · BonePilot：按集合导航控制器，快速旋转/移动，逐段撤销，让动画操作跟手",
@@ -3213,6 +3213,15 @@ def enter_pie_collection(context, rig, col_name, pie_layer=0):
         if col is None:
             return False, "骨架里没有集合「%s」" % col_name
 
+    # ★ v5.2.43：独显态下跳集合 —— 目标不在独显里就并进去。
+    #   否则目标骨骼全被 solo 遮住，跳过去屏幕毫无反应（用户会以为「没跳成」）。
+    #   已在独显覆盖范围内的不重复补星：祖先打了星，子集合本来就亮着。
+    try:
+        if solo_active(rig) and not solo_covers(rig, col_name):
+            solo_set(rig, solo_names(rig) + [col_name], commit=True)
+    except Exception:
+        pass
+
     # 隐藏的集合也要能进：collection_nav_names 会先把它显示出来
     names = collection_nav_names(rig, col)
     if not names:
@@ -3669,6 +3678,17 @@ def isolate_previous_collection(rig, keep_name, pie_layer=0):
         return
     if not pie_layer:
         return
+    # ★ v5.2.43：独显生效时整段跳过。
+    #   solo 遮罩优先于 is_visible，这里的 hide_collection_tree / show_collection
+    #   对屏幕没有任何实际作用；而 show_collection 里那句「看不见就清星标」
+    #   会把整份独显清光 —— 这就是「跳进独显集合却退出独显」的直接原因。
+    #   而且 solo 本身已经比「饼间互斥」更严格，跳过不会让画面变乱。
+    if solo_active(rig):
+        try:
+            rig.data["cn_last_pie_layer"] = pie_layer
+        except Exception:
+            pass
+        return
     # 第一次进饼先拍一张原始显示状态，之后随时能一键还原
     save_visibility_snapshot(rig)
     # 同样是整组展开，不是每格第一个
@@ -3704,7 +3724,17 @@ def isolate_previous_collection(rig, keep_name, pie_layer=0):
 
 
 def show_collection(col):
-    """显示集合及其所有父级；如果被 solo 挡住，清掉 solo。"""
+    """显示集合及其所有父级；**非独显态**下被遮挡才清 solo。
+
+    v5.2.43 修正：原来是无条件「不可见就清光所有星标」。但 col_visible 走的是
+    `is_visible_effectively`，它**把 solo 算在内** —— 于是独显三个部位之后，
+    饼里任何一格不在独显里的集合都会把整份独显清掉。用户报的「滑到格子上就
+    退出独显」就是这么来的（isolate_previous_collection 会对整张饼 8 格逐个
+    show_collection，必然踩到不在独显里的格子）。
+
+    solo 是遮罩，不是「看不见就得拆」的东西。它只允许被两种操作改写：
+    新的 solo_set（重新打星）和用户的显式还原（solo_clear）。
+    """
     if col is None:
         return
     chain = []
@@ -3717,7 +3747,7 @@ def show_collection(col):
             c.is_visible = True
         except Exception:
             pass
-    if not col_visible(col):
+    if not col_visible(col) and not solo_active(col.id_data):
         try:
             for c in _colls(col.id_data):
                 c.is_solo = False
@@ -4739,6 +4769,44 @@ def solo_names(rig):
         return [n for n in raw.split("|") if n]
     one = solo_collection_name(rig)
     return [one] if one else []
+
+
+def solo_active(rig):
+    """当前是否有集合打了 ★（原生 solo 正在生效）。
+
+    solo 是**最高优先级**的可见性遮罩：它生效期间，往任何集合写 is_visible
+    都只是改标志、屏幕不会变；真正会发生的副作用只剩「把星标清光」。
+    所以「solo 期间该不该做可见性操作」必须单独判断 —— 否则每一个顺手
+    调 show_collection 的路径（跳集合、换饼、导航取骨）都会静默拆掉独显。
+    """
+    try:
+        for c in _colls(rig):
+            if c.is_solo:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def solo_covers(rig, name):
+    """name 是否已被现有独显覆盖（它就是某个星标集合，或它的子孙）。
+
+    solo 是「集合 + 全部子集合」一起亮，所以祖先打了星时，子集合本来就看得见，
+    不需要再给它补星 —— 补了反而会改变可见范围。
+    """
+    if not name:
+        return False
+    for n in solo_names(rig):
+        c = _coll_get(rig, n)
+        if c is None:
+            continue
+        try:
+            for c2 in solo_tree(c):
+                if c2.name == name:
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def solo_tree(col):

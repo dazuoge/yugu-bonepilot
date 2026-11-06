@@ -1,8 +1,21 @@
 # 驭骨 · BonePilot 更新日志
 
-当前版本 **v5.2.42**。安装包见 [Releases](https://github.com/dazuoge/yugu-bonepilot/releases/latest)。
+当前版本 **v5.2.43**。安装包见 [Releases](https://github.com/dazuoge/yugu-bonepilot/releases/latest)。
 
 ---
+
+## v5.2.43 独显态下跳集合不再退出独显（2026-11-06）
+
+- **现象**：已经独显了三个部位，在星标饼里滑到其中一格想「跳到这个集合选第一根控制器」，一松手独显全没了，整份星标被清空；
+- **根因**（结构性，不是偶发）：`col_visible()` 走的是 `is_visible_effectively`，这个属性**把 solo 计算在内**。于是独显期间，饼里任何一格「不在独显集合里」的集合都会被判定为不可见，而 `show_collection()` 有一段兜底是「不可见就清掉所有 `is_solo`」。`isolate_previous_collection()` 会对**整张饼 8 格逐个**调 `show_collection()`，饼里总有几格不在独显里 —— 必然踩中。所以不是「跳到某个集合才丢」，而是**只要跳集合就丢**；
+- **修法**：
+  1. 新增 `solo_active(rig)`：判断是否有星标生效。solo 是最高优先级的可见性遮罩，它生效期间往集合写 `is_visible` 只是改标志、屏幕不变，**唯一实际副作用就是清星标**，必须单独判断；
+  2. `show_collection()`：独显期间**不再清 solo**。solo 只允许被两种操作改写 —— 新的 `solo_set()`（重新打星）与用户的显式还原（`solo_clear()`）；
+  3. `isolate_previous_collection()`：独显期间整段跳过（`cn_last_pie_layer` 仍照常记录）。饼间互斥本来就只是 solo 的弱化版，跳过不会让画面变乱；
+  4. `enter_pie_collection()`：跳过目标若不在独显覆盖范围内，**并入独显**（`solo_names + [目标]`，commit 落盘）。否则目标骨骼被 solo 遮住，跳过去屏幕毫无反应，用户会以为「没跳成」。新增 `solo_covers()` 做祖先判断 —— 祖先已打星时子集合本来就亮着，不重复补星、不改变可见范围；
+- **保持不变的**：独显本身仍由「扫星标 / 侧栏还原」两条路径控制，跳集合不会替用户做决定；外圈扫一颗仍然是「只独显这一颗」；
+- **验证**：新增 `t_solo_nav.py` 14 项（含 show_collection / isolate / 端到端跳集合 / modal 内圈移动+松手），全通过；C3 语义回归全通过；127 项差分仅 `auto_layout.slots`（交换加载顺序后仍是它 → 既有顺序效应）；便携目录真实 `addon_enable` 全部通过，14 条键位在位。
+
 
 ## v5.2.42 星标饼去掉修饰键：单颗替换 / 多颗并集（2026-11-05）
 
