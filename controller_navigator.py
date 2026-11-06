@@ -185,7 +185,7 @@
 bl_info = {
     "name": "驭骨 · BonePilot",
     "author": "默尔佐",
-    "version": (5, 2, 43),
+    "version": (5, 2, 44),
     "blender": (5, 2, 0),
     "location": "Pose Mode > N 面板 > Nav",
     "description": "驭骨 · BonePilot：按集合导航控制器，快速旋转/移动，逐段撤销，让动画操作跟手",
@@ -3213,15 +3213,12 @@ def enter_pie_collection(context, rig, col_name, pie_layer=0):
         if col is None:
             return False, "骨架里没有集合「%s」" % col_name
 
-    # ★ v5.2.43：独显态下跳集合 —— 目标不在独显里就并进去。
-    #   否则目标骨骼全被 solo 遮住，跳过去屏幕毫无反应（用户会以为「没跳成」）。
-    #   已在独显覆盖范围内的不重复补星：祖先打了星，子集合本来就亮着。
-    try:
-        if solo_active(rig) and not solo_covers(rig, col_name):
-            solo_set(rig, solo_names(rig) + [col_name], commit=True)
-    except Exception:
-        pass
-
+    # ★ v5.2.44：这里**不再**把目标并进独显。
+    #   v5.2.43 为了让「跳进未独显的集合」也能看见骨，做了自动并入；但独显
+    #   是用户亲手挑的集合，跳个集合就悄悄多一块，等于替用户做决定（用户原话：
+    #   「我明明没有滑到星标图标上，那个格子却一并进入了独显模式」）。
+    #   现在的分工：独显只由星标那一圈改变；跳集合只负责「选中谁、看哪里」，
+    #   目标不在独显里就是看不见 —— 想看得先把它的星打上。
     # 隐藏的集合也要能进：collection_nav_names 会先把它显示出来
     names = collection_nav_names(rig, col)
     if not names:
@@ -4788,27 +4785,6 @@ def solo_active(rig):
     return False
 
 
-def solo_covers(rig, name):
-    """name 是否已被现有独显覆盖（它就是某个星标集合，或它的子孙）。
-
-    solo 是「集合 + 全部子集合」一起亮，所以祖先打了星时，子集合本来就看得见，
-    不需要再给它补星 —— 补了反而会改变可见范围。
-    """
-    if not name:
-        return False
-    for n in solo_names(rig):
-        c = _coll_get(rig, n)
-        if c is None:
-            continue
-        try:
-            for c2 in solo_tree(c):
-                if c2.name == name:
-                    return True
-        except Exception:
-            continue
-    return False
-
-
 def solo_tree(col):
     """集合自己 + 所有子集合（Rigify 的集合是分层的）。"""
     out = [col]
@@ -4976,10 +4952,14 @@ def _wheel_sector(mx, my, cx, cy, count=8):
 def _wheel_star_r(geo):
     """星标命中环带的内边界（外边界见 _wheel_slot_polar）。
 
-    口径就是「方框外围那圈星」：扇区外沿往外到星标外侧再多一点。
-    内圈（扇区身上）一律不算命中 —— 否则刚开饼挪一下鼠标就误触。
+    v5.2.44：内边界对齐**星标图标本身**（星标中心 ± star_r），不再是
+    「扇区外沿 - 1」。原先只要过了扇区外沿就算命中，而星星是画在外沿之外
+    gap 处的 —— 中间那十几像素的空档也吃命中，表现就是「我明明没碰到星星，
+    格子却进了独显」。现在命中区严格从图标下缘开始（r_out + gap - star_r），
+    外侧再留 12px 余量；想改独显，鼠标就得真的放到那颗星上。
     """
-    return geo["r_out"] - 1.0
+    return max(geo["r_out"] + 1.0,
+               geo["r_out"] + geo["gap"] - geo["star_r"])
 
 
 def _wheel_slot_polar(cx, cy, ang_deg, r, geo, star_only=False):
