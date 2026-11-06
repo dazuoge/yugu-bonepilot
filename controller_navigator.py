@@ -185,7 +185,7 @@
 bl_info = {
     "name": "驭骨 · BonePilot",
     "author": "默尔佐",
-    "version": (5, 2, 44),
+    "version": (5, 2, 45),
     "blender": (5, 2, 0),
     "location": "Pose Mode > N 面板 > Nav",
     "description": "驭骨 · BonePilot：按集合导航控制器，快速旋转/移动，逐段撤销，让动画操作跟手",
@@ -4962,6 +4962,18 @@ def _wheel_star_r(geo):
                geo["r_out"] + geo["gap"] - geo["star_r"])
 
 
+def _wheel_btn_r(geo):
+    """中心「退出独显」按钮的半径（只在有星标时才启用，见 modal）。
+
+    取中心孔的一小半：默认 66px 的孔 → 约 30px 半径（60px 直径），点得中；
+    孔里剩下的那一圈（30~66px）仍然是原生的方向导航区，不会被按钮吃掉。
+    死区默认 12px 太细，单靠它当按钮会「点不准」，所以下限拉到 dead+6。
+    """
+    r = min(geo["r_in"] * 0.46, 44.0)
+    r = max(r, geo["dead"] + 6.0)
+    return max(6.0, min(r, geo["r_in"] - 2.0))
+
+
 def _wheel_slot_polar(cx, cy, ang_deg, r, geo, star_only=False):
     """极坐标反推扇区号；不在有效环带内返回 -1（与 modal 的判定同源）。"""
     if star_only:
@@ -5060,6 +5072,8 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
     不用滑到格子上，死区可调），松手 → 跳进集合并选中第一根骨；滑到外沿
     星星 → 当场独显（预览），滑回格子 → 退出独显，松手在星星上 → 独显
     定格。松手即退出饼。空格子 / 拖出饼外松手只关饼，不弹任何面板。
+    只要出现星标，中心孔会亮起「退出」按钮：悬停预览全部还原，点一下
+    一键退出独显（不必再挨个去点每颗星）。
     画不出来就自动退回原生饼，键位不会失效。
     """
     bl_idname = "pose.cn_wheel_v45"
@@ -5109,6 +5123,13 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
         self._sweep = -1
         self._applied = None         # 上一次真正落场景的集合组合，用来去重
         self._rcache = {}
+        # v5.2.45 中心「退出独显」按钮
+        self._wipe = False           # 悬停按钮时的预览态：一个都不独显
+        self._btn_hover = False
+        self._btn_on = False         # 本手势里出现过星标 → 按钮常驻（不会划到一半消失）
+        self._solo0 = False          # 开饼时是否已有星标（含侧栏手点的）
+        self._snap_n = 0             # 开饼时亮着的星标块数（中心计数用）
+        self._n_now = 0              # 此刻亮着几块（随预览实时更新）
         self._load_slots(context)
         try:
             rig0 = pie_rig(context)
@@ -5119,6 +5140,23 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 self._snap = solo_names(rig0)
             except Exception:
                 self._snap = []
+            try:
+                self._solo0 = solo_active(rig0)
+            except Exception:
+                self._solo0 = bool(self._snap)
+            if self._solo0:
+                self._btn_on = True
+                self._snap_n = len(self._snap)
+                if not self._snap_n:
+                    # 侧栏手点的星：数「最上层」的星标集合（父子都亮只算一次）
+                    try:
+                        self._snap_n = sum(
+                            1 for c in _colls(rig0)
+                            if c.is_solo and not (c.parent is not None
+                                                  and c.parent.is_solo))
+                    except Exception:
+                        self._snap_n = 1
+            self._n_now = self._snap_n
             if self._snap:
                 # 只在画面上标出来（灰星 = 当前独显、但不是本次选中的），
                 # **不参与本次选中集** —— 否则「单颗 = 替换」就退化成累加了
@@ -5196,22 +5234,30 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
         return out
 
     def _apply_preview(self, rig):
-        """落场景（不写键）。同一组集合不重复写，省得每帧刷可见性。"""
+        """落场景（不写键）。同一组集合不重复写，省得每帧刷可见性。
+
+        _wipe=True 是「中心退出按钮」的悬停预览：先预览成「一个都不独显」，
+        让你在点下去之前就看见结果，跟原生按钮的 hover 反馈一个意思。
+        """
         if rig is None:
             return
-        names = self._commit_names(rig)
-        key = tuple(names)
+        wipe = bool(getattr(self, "_wipe", False))
+        names = [] if wipe else self._commit_names(rig)
+        key = (tuple(names), wipe)
         if key == self._applied:
             return
         self._applied = key
         try:
             if names:
                 solo_set(rig, names, commit=False)
+            elif wipe:
+                solo_set(rig, [], commit=False)
             else:
                 solo_set(rig, self._snap, commit=False)
         except Exception:
             pass
         self._preview = "|".join(names) if names else None
+        self._n_now = len(names)      # 中心按钮里的数字：此刻亮着几块
 
     def _toggle_lock(self, slot, rig, add_only=False):
         """切换一格的锁。add_only=True 只加不减（从中心区重新瞄准时用）。"""
@@ -5264,7 +5310,11 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
             if self._hover >= 0 and self._star_hover < 0:
                 mid = math.radians(90.0 - self._hover * 45.0)
                 a0, a1 = mid - math.radians(22.5), mid + math.radians(22.5)
-                wv = _sector_tris(cx, cy, a0, a1, max(6.0, geo["dead"] * 0.8), r_in)
+                # 有中心按钮时扇区从按钮外沿起画，免得压在按钮上显脏
+                w_r0 = max(6.0, geo["dead"] * 0.8)
+                if getattr(self, "_btn_on", False):
+                    w_r0 = max(w_r0, _wheel_btn_r(geo) + 4.0)
+                wv = _sector_tris(cx, cy, a0, a1, w_r0, r_in)
                 wb = batch_for_shader(shader, 'TRIS', {"pos": wv})
                 shader.bind()
                 shader.uniform_float("color", (0.24, 0.40, 0.68, 0.55))
@@ -5322,7 +5372,9 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 w, h = blf.dimensions(0, txt)
                 blf.position(0, tx - w * 0.5, ty - h * 0.5, 0)
                 blf.draw(0, txt)
-            if locks:
+            if getattr(self, "_btn_on", False):
+                self._draw_btn(shader, blf, batch_for_shader, cx, cy, geo)
+            elif locks:
                 # 中心孔报数：多选时一眼看到锁了几个
                 num = "%d" % len(locks)
                 blf.size(0, max(14, geo["font"] + 6))
@@ -5336,6 +5388,49 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 gpu.state.blend_set('NONE')
             except Exception:
                 pass
+
+    def _draw_btn(self, shader, blf, batch_for_shader, cx, cy, geo):
+        """中心「退出独显」按钮：一块圆盘 + 一圈描边 + 「退出」字样。
+
+        只在有星标时才画（_btn_on）。圆里的数字 = 当前亮着的星标块数，
+        点下去就是全部关掉；悬停时整体转暖色，和饼里其它高亮同一套语义。
+        """
+        br = _wheel_btn_r(geo)
+        hot = bool(self._btn_hover)
+        # 圆面
+        disc = _sector_tris(cx, cy, 0.0, 2.0 * math.pi, 0.0, br, seg=40)
+        b = batch_for_shader(shader, 'TRIS', {"pos": disc})
+        shader.bind()
+        shader.uniform_float("color", (0.52, 0.24, 0.14, 0.92) if hot
+                             else (0.15, 0.13, 0.12, 0.88))
+        b.draw(shader)
+        # 描边
+        ring = _sector_tris(cx, cy, 0.0, 2.0 * math.pi, br - 1.6, br, seg=40)
+        b = batch_for_shader(shader, 'TRIS', {"pos": ring})
+        shader.bind()
+        shader.uniform_float("color", (1.0, 0.68, 0.36, 1.0) if hot
+                             else (0.86, 0.55, 0.26, 0.85))
+        b.draw(shader)
+        # 数字：当前亮着几块
+        n = 0 if getattr(self, "_wipe", False) else getattr(
+            self, "_n_now", len(self._locks) or getattr(self, "_snap_n", 0))
+        if n:
+            blf.size(0, max(11, geo["font"] + 2))
+            blf.color(0, 1.0, 0.88, 0.52, 1.0)
+            t = "%d" % n
+            w, h = blf.dimensions(0, t)
+            blf.position(0, cx - w * 0.5, cy + br * 0.22 - h * 0.5, 0)
+            blf.draw(0, t)
+        # 文字
+        blf.size(0, max(9, geo["font"] - 3))
+        if hot:
+            blf.color(0, 1.0, 0.86, 0.62, 1.0)
+        else:
+            blf.color(0, 0.92, 0.80, 0.66, 1.0)
+        t2 = "退出"
+        w2, h2 = blf.dimensions(0, t2)
+        blf.position(0, cx - w2 * 0.5, cy - br * 0.42 - h2 * 0.5, 0)
+        blf.draw(0, t2)
 
     def _end(self, context):
         if self._handle is not None:
@@ -5372,6 +5467,33 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
         self._preview = None
         return {'FINISHED'}
 
+    def _wipe_solo(self, context):
+        """中心按钮：一键退出独显（清掉全部星标，含侧栏手点的那些）。
+
+        以前要退出得挨个滑到每颗星上点掉，三个部位就是三次往返；现在
+        一颗按钮收工。solo_clear 同时清数据键，所以侧栏「正在独显」也归零。
+        """
+        self._end(context)
+        try:
+            rig = pie_rig(context)
+        except Exception:
+            rig = None
+        if rig is not None:
+            try:
+                solo_clear(rig)
+            except Exception:
+                pass
+        self._locks = []
+        self._snap = []
+        self._snap_slots = []
+        self._snap_n = 0
+        self._solo0 = False
+        self._btn_on = False
+        self._btn_hover = False
+        self._wipe = False
+        self._preview = None
+        return {'FINISHED'}
+
     def modal(self, context, event):
         try:
             if event.type == 'MOUSEMOVE':
@@ -5384,6 +5506,7 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 self._last_r = r
                 self._r = r
                 star_r = _wheel_star_r(geo)
+                btn_r = _wheel_btn_r(geo)
                 r_max = geo["r_out"] + geo["gap"] + geo["star_r"] + 12
                 if r < geo["dead"] or r > r_max:
                     idx = -1            # 中心死区 / 拖太远 = 不选
@@ -5396,9 +5519,27 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                     rig = pie_rig(context)
                 except Exception:
                     rig = None
-                if r < geo["dead"] and self._locks:
-                    # 收回中心孔 = 清空本次选中。这是唯一的「反悔」手势，
-                    # 不用按任何键；手停在中心孔里松手也等于什么都没选。
+                # ★ v5.2.45 中心「退出独显」按钮：只要出现过星标就常驻。
+                #   悬停 = 预览「全部还原」，点一下才真正落定。
+                in_btn = bool(getattr(self, "_btn_on", False)) and r <= btn_r
+                if in_btn != bool(getattr(self, "_btn_hover", False)):
+                    self._btn_hover = in_btn
+                    changed = True
+                if in_btn:
+                    if idx >= 0 or star >= 0:
+                        self._hover = self._star_hover = idx = star = -1
+                        changed = True
+                    if not getattr(self, "_wipe", False):
+                        self._wipe = True
+                        self._locks = []
+                        self._sweep = -1
+                        self._apply_preview(rig)
+                elif getattr(self, "_wipe", False):
+                    # 只是划过按钮没点：退掉预览，回到本次选中 / 开饼前的星
+                    self._wipe = False
+                    self._apply_preview(rig)
+                elif r < geo["dead"] and self._locks:
+                    # 没有星标时的中心孔 = 清空本次选中（原有的「反悔」手势）
                     self._locks = []
                     self._sweep = -1
                     self._apply_preview(rig)
@@ -5414,6 +5555,8 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                         if self._toggle_lock(s, rig, add_only):
                             changed = True
                     self._sweep = star
+                    if self._locks:
+                        self._btn_on = True
                 if changed and context.area is not None:
                     context.area.tag_redraw()
                 return {'RUNNING_MODAL'}
@@ -5428,6 +5571,9 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
                 self._preview = None
                 self._sweep = -1
                 self._rcache = {}
+                self._wipe = False
+                self._btn_hover = False
+                self._btn_on = bool(self._solo0)
                 nxt = self.layer + (1 if event.type == 'WHEELUPMOUSE' else -1)
                 if nxt < 1:
                     nxt = 3
@@ -5444,6 +5590,9 @@ class POSE_OT_cn_wheel_v45(bpy.types.Operator):
             if event.type == 'LEFTMOUSE':
                 if event.value == 'PRESS':
                     return {'RUNNING_MODAL'}
+                # ★ v5.2.45 点中心按钮 = 退出独显（一键还原全部星标）
+                if getattr(self, "_btn_hover", False) and getattr(self, "_btn_on", False):
+                    return self._wipe_solo(context)
                 # 扫过星标 = 本次选中，直接按 C3 规则定格
                 if self._locks:
                     return self._commit(context)
