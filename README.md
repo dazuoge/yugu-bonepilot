@@ -1,20 +1,31 @@
 # 驭骨 · BonePilot
 
+> **当前分支 `arp-bip-v2.7` = 官方 v5.2.45 + ARP BIP 扩展 v2.7（实验分支）**
+>
+> 给 ARP 骨架加了「拖 FK 手控骨、手臂像 3ds Max Biped 一样 IK 跟随、结果仍写回 FK」
+> 的能力，并让 BIP 拖动时也只显示当前控制器。`main` 分支仍是纯净的 v5.2.45，
+> [Releases 最新正式版](https://github.com/dazuoge/yugu-bonepilot/releases/latest)
+> 也不受影响。扩展源码与说明见 [`bip/`](bip/README.md)。
+
 Blender 插件：按集合导航控制器，快速旋转/移动，逐段撤销，让动画操作跟手。
 
-面向 **Blender 5.2+**（Rigify / AniMate / ARP 类骨架均可使用）。
+面向 **Blender 5.2+**（Rigify / AniMate / ARP 类骨架均可使用）；本分支的 BIP 扩展在 **Blender 5.3** 上实测。
 
-当前版本：**v5.2.45**（2026-11-06）
+当前版本：**v5.2.45 + ARP BIP v2.7**（2026-11-14，本分支）
 
 ## 下载
 
-- **安装包（推荐）**：[Releases → 最新版](https://github.com/dazuoge/yugu-bonepilot/releases/latest)，文件名 `yugu-bonepilot-v5.2.45.zip`
-- **单文件**：[`controller_navigator.py`](controller_navigator.py)（与安装包内文件逐字节一致，md5 `7db954229ff5a0387e3a4fc2c2d23d95`）
+- **本分支整合版（推荐）**：[`controller_navigator.py`](controller_navigator.py)
+  —— 已内置 ARP BIP v2.7，可直接按下方步骤安装；本地文件 md5 `c9a3310be7315026e3dbd795c433c326`
+  （CRLF 换行；经 GitHub 下载时行尾可能被规范化，不影响使用）。
+- **官方稳定版 v5.2.45**：切到 `main` 分支，或到
+  [Releases → 最新版](https://github.com/dazuoge/yugu-bonepilot/releases/latest)
+  下载 `yugu-bonepilot-v5.2.45.zip`。
 
 ## 安装
 
 1. Blender → `Edit → Preferences → Add-ons` → 右上角 `⌄` → **Install from Disk…**
-2. 选 `yugu-bonepilot-v5.2.45.zip`（或直接选 `controller_navigator.py`）
+2. 选本分支的 `controller_navigator.py`（官方稳定版则是 `yugu-bonepilot-v5.2.45.zip`）
 3. 勾选启用「驭骨 · BonePilot」
 4. 已经装过旧版的：覆盖后按 `F3 → Reload Scripts`，或重启 Blender —— 否则跑的还是内存里的旧代码
 
@@ -34,6 +45,20 @@ Blender 插件：按集合导航控制器，快速旋转/移动，逐段撤销�
 - **全键位自定义**：所有动作的键位都能自己绑。偏好里一张表，点键名直接按想要的键 —— 鼠标中键 / 侧键 / 滚轮方向都认，旋转、移动模式里的滚轮也可分别绑定。
 - **切集合只留一个**：从一个控制器集合跳到另一个，上一次进入的集合整组隐藏，屏幕上永远只有一套控制器。饼菜单槽位可选骨架原本自带的全部集合（含空集合）。
 - **逐段撤销**：操作按段落拆分，撤销不再一撤到底。
+
+## ARP BIP 拖手（本分支新增）
+
+- **FK 保持 FK**：拖动 ARP 的手部 FK 控制器，上臂 / 前臂 IK 式跟随，但结果写回
+  `c_arm_fk` / `c_forearm_fk` 的旋转；不留 IK 约束，`ik_fk_switch` 不变。
+- **自动理顺旋转曲线**：多帧画弧时自动消除四元数 `q/-q`、欧拉多解分支造成的
+  中间帧暴跳，只换数值表示、关键帧姿态逐帧零改变。
+- **运动路径实时跟手**：拖动中直接写当前帧路径点，松手同步全量重算，与原生
+  移动模式的跟手速度一致。
+- **BIP 也独显**：拖动时只显示正在操作的手控骨，松手 / 取消 / 切骨逐骨还原。
+- **前臂铰链 / 近伸直 / 往外拉直**：锁轴投影、解析二连杆与步长钳位。
+
+仅限 ARP 骨架，Rigify / AniMate 行为不变。详细说明、边界与实测数据见
+[`bip/README.md`](bip/README.md)。
 
 ## 版本历史
 
