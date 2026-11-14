@@ -15,6 +15,10 @@ Blender 插件：按集合导航控制器，快速旋转/移动，逐段撤销�
 
 ## 下载
 
+- **打包下载（推荐）**：[Releases → `bip-v2.7`](https://github.com/dazuoge/yugu-bonepilot/releases/tag/bip-v2.7)
+  - `yugu-bonepilot-bip-v2.7.zip` —— 单文件可拖入安装版（包内 `controller_navigator_v4971.py`）
+  - `yugu-bonepilot-bip-v2.7-source.zip` —— 扩展源码、幂等植入器、全套回归与 v1.6~v2.6 回退备份
+  - 该 Release 为 **预发布**，`/releases/latest` 仍指向正式版 v5.2.45。
 - **本分支整合版（推荐）**：[`controller_navigator.py`](controller_navigator.py)
   —— 已内置 ARP BIP v2.7，可直接按下方步骤安装；本地文件 md5 `c9a3310be7315026e3dbd795c433c326`
   （CRLF 换行；经 GitHub 下载时行尾可能被规范化，不影响使用）。
