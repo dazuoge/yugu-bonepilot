@@ -188,17 +188,21 @@ check('F3 交还时显隐已还原', diff(seen.get('hide_at_start', {}), base) =
 check('F4 交还后快照作废', m._BIP_SOLO_ACTIVE is None)
 check('F5 交还后显隐仍是原始值', diff(hide_map(), base) == [])
 
-# F6 交还失败：必须重新独显，不能把整副骨架亮着扔给用户
+# F6~F8：v2.8 行为变更（修「拖完要按 Alt H」）。
+# v2.7 在这里断言「重新独显」，但 _handoff 紧接着返回 FINISHED、BIP 模态
+# 已经结束，那份独显从此无人还原 —— 实测 425/426 根骨留在 hide=True。
+# 现在改为按开拖前快照还原并清掉快照。
 m.bip_start_cn_mode = lambda context, mode: fake_start(
     context, mode, {'CANCELLED'})
 m.bip_solo_apply(ctx, rig, HAND_R, {HAND_R})
 m.POSE_OT_cn_bip_drag_v45._handoff(fs, ctx, ARM_R)
-check('F6 交还失败重新独显', visible_names() == {HAND_R},
-      str(sorted(visible_names()))[:60])
-check('F7 失败后快照仍可还原',
-      m._BIP_SOLO_ACTIVE is not None)
+check('F6 交还失败精确还原', diff(hide_map(), base) == [],
+      'diff=%d' % len(diff(hide_map(), base)))
+check('F7 失败后快照已清', m._BIP_SOLO_ACTIVE is None)
+m.bip_solo_apply(ctx, rig, HAND_R, {HAND_R})
+check('F8 失败后仍可正常再独显', visible_names() == {HAND_R})
 m.bip_solo_restore(ctx)
-check('F8 失败后能精确还原', diff(hide_map(), base) == [])
+check('F8b 再次还原精确', diff(hide_map(), base) == [])
 
 m.bip_end = orig_end
 m.bip_start_cn_mode = orig_start
