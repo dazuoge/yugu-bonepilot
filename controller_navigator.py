@@ -13734,6 +13734,10 @@ def unregister():
 
 
 
+
+
+
+
 # >>> ARP BIP EXT BEGIN (WorkBuddy) >>>
 #
 # ARP BIP Drag —— 内嵌于「驭骨 · BonePilot」的扩展块（自包含，不依赖独立插件）。
@@ -13844,6 +13848,13 @@ def unregister():
 #       修法：新增 cancel()（外部取消也还原）、交还失败改为直接还原、
 #       模块级活跃标记 + 0.5s 定时守卫（模态已结束却有未还原快照就自动还原）、
 #       开拖前的脏状态自愈（按最近一次干净显隐基准，判据极严不误伤手动隐藏）。
+#       v2.9 修「拖完按一下撤回又只剩手掌」：BIP 是带 UNDO 的 operator，
+#         Blender 的撤销快照包含 PoseBone.hide，Ctrl+Z 会把拖动中的独显态
+#         整个恢复出来；v2.8 的守卫只在快照未 forget 时生效，且旧判据要求
+#         「干净态里隐藏骨不到一半」——真实 ARP 工程 426 根里本来就有
+#         350 根变形骨 hide=True，判据静默失效。改为 undo_post / redo_post
+#         即时守卫 + 定时兜底，只改显隐、姿态与关键帧撤销完全不受影响；
+#         判据改用「干净态里可见却被藏起来的骨数」，不再看隐藏骨比例。
 #
 # 切骨联动：拖动中按「切骨」手势（默认 Alt+滚轮，跟随驭骨偏好）时，调用驭骨
 #       自己的 pose.controller_nav_v45 切一格，再按新骨能力交还它的 ROT/MOVE
@@ -15638,6 +15649,11 @@ _BIP_SOLO_CLEAN = None       # (rig.name, {bone: hide}, keep) 最近一次干净
 _BIP_SOLO_GUARD_LOG = '未触发'
 _BIP_SOLO_GUARD_HITS = 0
 _BIP_SOLO_TIMER_ON = False
+# v2.9：撤销 / 重做后的显隐守卫
+_BIP_UNDO_HOOKS_ON = False
+_BIP_UNDO_BUSY = False
+_BIP_UNDO_LOG = '未触发'
+_BIP_UNDO_HITS = 0
 
 
 def bip_solo_enabled():
@@ -15799,36 +15815,58 @@ def bip_solo_forget():
     _BIP_SOLO_KEEP = set()
 
 
-def bip_solo_heal_if_leaked(rig):
-    """v2.8：开新拖之前，若当前显隐是上轮残留的独显，按干净基准还原。
+def bip_solo_leak_signature(rig, clean, keep):
+    """判断当前显隐是不是「上一次 BIP 独显」被外部恢复出来的残留。
 
-    判据刻意很严，避免把用户手动隐藏的骨架「好心」全亮出来：
-    同一骨架同名同骨集、>=90% 骨被藏、干净基准里隐藏不到一半、
-    且当前可见集恰好等于上一次独显的 keep 集。
+    v2.9：旧判据要求「干净基准里隐藏骨不到一半」，但真实 ARP 工程 426 根
+    里本来就有 350 根变形骨 hide=True，这条判据永远不成立，v2.8 的开拖
+    自愈在真实场景是静默失效的。改用三个强特征，不再看隐藏骨比例：
+      ① 当前可见集恰好等于上轮独显的 keep；
+      ② 干净基准里可见、现在却被藏起来的骨 >= 一半且 >= 3 根；
+      ③ 干净基准里隐藏、现在却亮出来的骨（keep 除外）必须为 0。
+    三条同时成立才认定残留，绝不把用户手动隐藏的骨架「好心」全亮出来。
+    返回被错误隐藏的骨数（0 = 不是残留）。
     """
+    if not clean or not keep:
+        return 0
+    try:
+        cur = {b.name: bool(b.hide) for b in rig.pose.bones}
+    except Exception:
+        return 0
+    if set(cur) != set(clean):
+        return 0
+    ks = set(keep)
+    if {k for k, v in cur.items() if not v} != ks:
+        return 0
+    clean_vis = [k for k, h in clean.items() if not h]
+    if len(clean_vis) < 3:
+        return 0
+    if any(h and not cur[k] and k not in ks for k, h in clean.items()):
+        return 0
+    wrong = sum(1 for k in clean_vis if cur[k])
+    if wrong < max(3, (len(clean_vis) + 1) // 2):
+        return 0
+    return wrong
+
+
+def bip_solo_heal_if_leaked(rig):
+    """v2.8：开新拖之前，若当前显隐是上轮残留的独显，按干净基准还原。"""
     global _BIP_SOLO_GUARD_LOG, _BIP_SOLO_GUARD_HITS
     c = _BIP_SOLO_CLEAN
     if not c or c[0] != rig.name or _BIP_DRAG_ACTIVE:
         return False
-    clean, keep = c[1], set(c[2] or ())
-    cur = {b.name: bool(b.hide) for b in rig.pose.bones}
-    n = len(cur)
-    if n < 8 or set(cur) != set(clean) or not keep:
-        return False
-    hidden = sum(cur.values())
-    clean_hidden = sum(clean.values())
-    vis = {k for k, v in cur.items() if not v}
-    if hidden < n * 0.9 or clean_hidden > n * 0.5 or vis != keep:
+    wrong = bip_solo_leak_signature(rig, c[1], set(c[2] or ()))
+    if not wrong:
         return False
     try:
-        for name, h in clean.items():
+        for name, h in c[1].items():
             b = rig.pose.bones.get(name)
             if b is not None:
                 b.hide = h
     except Exception:
         return False
     _BIP_SOLO_GUARD_HITS += 1
-    _BIP_SOLO_GUARD_LOG = '开拖前自愈：清掉 %d 根残留隐藏' % hidden
+    _BIP_SOLO_GUARD_LOG = '开拖前自愈：清掉 %d 根残留隐藏' % wrong
     return True
 
 
@@ -15839,8 +15877,14 @@ def bip_solo_guard():
     只负责「Blender 连 cancel 都没给、直接把模态丢了」的极端情况。
     """
     global _BIP_SOLO_GUARD_LOG, _BIP_SOLO_GUARD_HITS
-    if _BIP_DRAG_ACTIVE or _BIP_SOLO_ACTIVE is None:
+    if _BIP_DRAG_ACTIVE:
         return False
+    if _BIP_SOLO_ACTIVE is None:
+        # v2.9：撤销 / 重做把独显态恢复出来时快照已 forget，定时兜底补上。
+        try:
+            return bool(bip_solo_repair_after_undo('定时兜底'))
+        except Exception:
+            return False
     rig = _BIP_SOLO_ACTIVE[0]
     try:
         _ = rig.name           # 换过文件：旧 rig 已失效，别往新骨架写显隐
@@ -15854,8 +15898,109 @@ def bip_solo_guard():
     return False
 
 
+# ------------------------------------- v2.9：撤销 / 重做后的显隐守卫
+def bip_solo_repair_after_undo(tag='撤回'):
+    """undo / redo 把拖动中的独显态恢复出来时，按干净基准还原显隐。
+
+    BIP 是带 UNDO 的 operator，Blender 的撤销快照包含 PoseBone.hide。
+    拖动结束虽然按快照还原了，用户一按 Ctrl+Z 又回到「只有手掌控制器」
+    的那一刻。显隐属于视图状态，不该跟着姿态撤销历史走：这里只写 hide，
+    姿态、关键帧、运动路径的撤销结果完全不受影响。
+    """
+    global _BIP_UNDO_BUSY, _BIP_UNDO_LOG, _BIP_UNDO_HITS
+    if _BIP_UNDO_BUSY or _BIP_DRAG_ACTIVE:
+        return False
+    c = _BIP_SOLO_CLEAN
+    if not c:
+        return False
+    rig = None
+    try:
+        rig = _bip_bpy.data.objects.get(c[0])
+    except Exception:
+        return False
+    if rig is None or getattr(rig, 'type', '') != 'ARMATURE':
+        return False
+    wrong = bip_solo_leak_signature(rig, c[1], set(c[2] or ()))
+    if not wrong:
+        return False
+    _BIP_UNDO_BUSY = True
+    try:
+        for name, h in c[1].items():
+            b = rig.pose.bones.get(name)
+            if b is not None:
+                b.hide = h
+        # 撤销可能把导航快照也恢复成旧的，清掉免得污染普通状态切骨。
+        g = globals()
+        g['_NAV_VIS'] = None
+        g['_NAV_VIS_RIG'] = None
+    except Exception:
+        return False
+    finally:
+        _BIP_UNDO_BUSY = False
+    _BIP_UNDO_HITS += 1
+    _BIP_UNDO_LOG = '%s后还原 %d 根 · 累计 %d 次' % (
+        tag, wrong, _BIP_UNDO_HITS)
+    try:
+        _bip_bpy.context.view_layer.update()
+    except Exception:
+        pass
+    return True
+
+
+@_bip_bpy.app.handlers.persistent
+def _bip_undo_post_handler(*args, **kwargs):
+    try:
+        bip_solo_repair_after_undo('撤回')
+    except Exception:
+        pass
+
+
+@_bip_bpy.app.handlers.persistent
+def _bip_redo_post_handler(*args, **kwargs):
+    try:
+        bip_solo_repair_after_undo('重做')
+    except Exception:
+        pass
+
+
+def _bip_install_undo_hooks():
+    """按回调列表的实际情况补装，不用模块标志短路。
+
+    实测 5.3：Blender 载入 .blend 会清掉所有非 persistent 的 handlers，
+    而模块里的 _BIP_UNDO_HOOKS_ON 仍然是 True —— 旧写法只会 install 一次，
+    文件一打开守卫就永久失效。persistent 装饰 + 定时器逐轮补装双保险。
+    """
+    global _BIP_UNDO_HOOKS_ON
+    for name, fn in (('undo_post', _bip_undo_post_handler),
+                     ('redo_post', _bip_redo_post_handler)):
+        try:
+            lst = getattr(_bip_bpy.app.handlers, name)
+            if not any(getattr(f, '__name__', '') == fn.__name__
+                       for f in lst):
+                lst.append(fn)
+        except Exception as exc:
+            print('[ARP BIP] %s hook: %s' % (name, exc))
+    _BIP_UNDO_HOOKS_ON = True
+
+
+def _bip_remove_undo_hooks():
+    global _BIP_UNDO_HOOKS_ON
+    for name, fn in (('undo_post', _bip_undo_post_handler),
+                     ('redo_post', _bip_redo_post_handler)):
+        try:
+            lst = getattr(_bip_bpy.app.handlers, name)
+            for f in list(lst):
+                if getattr(f, '__name__', '') == fn.__name__:
+                    lst.remove(f)
+        except Exception:
+            pass
+    _BIP_UNDO_HOOKS_ON = False
+
+
 def _bip_solo_timer():
     try:
+        # 载入 .blend 后 handlers 可能被 Blender 清掉；常驻定时器每轮补装。
+        _bip_install_undo_hooks()
         bip_solo_guard()
     except Exception:
         pass
@@ -16486,7 +16631,7 @@ class VIEW3D_PT_cn_bip_v45(_bip_bpy.types.Panel):
             key_label = globals()['move_key_label']()
         except Exception:
             key_label = '移动键'
-        layout.label(text='已并入驭骨 v2.8 · 拖动结束必定还原控制器',
+        layout.label(text='已并入驭骨 v2.9 · 撤回后控制器不再残留隐藏',
                      icon='CHECKMARK')
         box = layout.box()
         box.label(text='选中 FK 手控骨按 %s' % key_label, icon='LINKED')
@@ -16511,6 +16656,7 @@ class VIEW3D_PT_cn_bip_v45(_bip_bpy.types.Panel):
         box.label(text='求解模式: %s' % _BIP_MODE_LOG, icon='INFO')
         box.label(text='独显: %s' % _BIP_SOLO_LOG, icon='INFO')
         box.label(text='显隐兜底: %s' % _BIP_SOLO_GUARD_LOG, icon='INFO')
+        box.label(text='撤销显隐: %s' % _BIP_UNDO_LOG, icon='INFO')
         # v2.3：已有动画被旧版旋转模式写坏过关键帧时，一键归一化分支。
         fixbox = layout.box()
         fixbox.label(text='旧关键帧中间插值乱转？', icon='ERROR')
@@ -16602,6 +16748,10 @@ def bip_register():
     except Exception:
         pass
     _bip_install_solo_guard()          # v2.8：0.5s 显隐残留兜底
+    try:
+        _bip_install_undo_hooks()      # v2.9：Ctrl+Z / 重做即时还原显隐
+    except Exception as exc:
+        print('[ARP BIP] undo hooks: %s' % exc)
     _BIP_OWNED = True
 
 
@@ -16613,6 +16763,7 @@ def bip_unregister():
     _BIP_DRAG_ACTIVE = False
     bip_solo_restore()
     _bip_remove_solo_guard()
+    _bip_remove_undo_hooks()
     _bip_remove_mpath_hooks()
     _bip_remove_insert_hook()
     for cls in (VIEW3D_PT_cn_bip_v45,
