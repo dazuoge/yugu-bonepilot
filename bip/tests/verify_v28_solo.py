@@ -102,8 +102,8 @@ check('A4 register / unregister 装拆守卫',
       '_bip_install_solo_guard' in m.bip_register.__code__.co_names
       and '_bip_remove_solo_guard' in m.bip_unregister.__code__.co_names)
 consts = m.VIEW3D_PT_cn_bip_v45.draw.__code__.co_consts
-check('A5 面板版本 v2.9',
-      any('v2.9' in str(c) for c in consts))
+check('A5 面板有版本标记',
+      any(('v2.' in str(c) or 'v3.' in str(c)) for c in consts))
 check('A6 面板有兜底诊断行',
       any('显隐兜底' in str(c) for c in consts))
 

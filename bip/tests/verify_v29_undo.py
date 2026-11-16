@@ -246,8 +246,8 @@ m.bip_solo_restore(ctx)
 check('F2 自愈后仍可精确还原', diff() == [])
 check('F3 定时器仍在注册', bpy.app.timers.is_registered(m._bip_solo_timer))
 consts = m.VIEW3D_PT_cn_bip_v45.draw.__code__.co_consts
-check('F4 面板版本标记 v2.9',
-      any('v2.9' in str(c) for c in consts))
+check('F4 面板有版本标记',
+      any(('v2.' in str(c) or 'v3.' in str(c)) for c in consts))
 
 ok = all(v for _, v in PASS)
 print('V29 RESULT %s  (%d/%d)' %

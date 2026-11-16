@@ -13738,6 +13738,8 @@ def unregister():
 
 
 
+
+
 # >>> ARP BIP EXT BEGIN (WorkBuddy) >>>
 #
 # ARP BIP Drag —— 内嵌于「驭骨 · BonePilot」的扩展块（自包含，不依赖独立插件）。
@@ -13855,6 +13857,18 @@ def unregister():
 #         350 根变形骨 hide=True，判据静默失效。改为 undo_post / redo_post
 #         即时守卫 + 定时兜底，只改显隐、姿态与关键帧撤销完全不受影响；
 #         判据改用「干净态里可见却被藏起来的骨数」，不再看隐藏骨比例。
+#       v3.0 修「旋转模式下控件闪烁」：驭骨原生 MOVE/ROT 模态按与 BIP
+#         完全相同的规则独显（可见集 = 选中骨），hide 数值上无法与 BIP 的
+#         撤销残留区分；v2.9 的 0.5s 定时守卫与 undo_post 守卫会把正在
+#         旋转时的独显当成残留，按干净基准把 73 根控制器整副亮回来，
+#         表现为「先全部隐藏，轻微一动又突然全部显示」。修法：守卫先查
+#         「是否有非 BIP 模态在跑」（window.modal_operators + 驭骨闸门），
+#         有就放行并撤销授权；零快照兜底另需本轮 BIP 独显显式授权
+#         （_BIP_SOLO_ARMED），且 operator 正常收尾立刻消费掉授权，只有
+#         Blender 连 cancel 都没给的异常结束才留给定时守卫。外来模态检测
+#         优先用驭骨自己的 _MODAL_ONCE 闸门，模态算子只认白名单（避免用户
+#         常驻插件把守卫永久关掉、把 v2.9 的撤销修复弄失效）。真实
+#         undo/redo 路径仍照常修复，不回归 v2.9。
 #
 # 切骨联动：拖动中按「切骨」手势（默认 Alt+滚轮，跟随驭骨偏好）时，调用驭骨
 #       自己的 pose.controller_nav_v45 切一格，再按新骨能力交还它的 ROT/MOVE
@@ -15654,6 +15668,13 @@ _BIP_UNDO_HOOKS_ON = False
 _BIP_UNDO_BUSY = False
 _BIP_UNDO_LOG = '未触发'
 _BIP_UNDO_HITS = 0
+# v3.0：守卫只管 BIP 自己造成的残留，绝不碰别的算子正在进行的独显
+_BIP_SOLO_ARMED = False      # 本轮 BIP 独显是否仍授权零快照兜底
+_BIP_FOREIGN_SKIPS = 0       # 因「别的模态在跑」而放行的次数（面板诊断）
+_BIP_FOREIGN_MODAL_PROBE = None   # 无头回归注入：模拟别的模态正在运行
+# 只把「会接管显隐」的算子当成外来模态。用户机器上常驻着一批插件的模态
+# 监听算子，若任何非 BIP 模态都算，守卫会被永久关掉、v2.9 的撤销修复失效。
+_BIP_FOREIGN_MODAL_HINTS = ('cn_', 'transform', 'view3d.')
 
 
 def bip_solo_enabled():
@@ -15718,6 +15739,7 @@ def bip_solo_apply(context, rig, active=None, keep=None):
     hide=True 记成开拖前的原始状态（否则之后怎么 restore 都回不来）。
     """
     global _BIP_SOLO_ACTIVE, _BIP_SOLO_KEEP, _BIP_SOLO_LOG, _BIP_SOLO_CLEAN
+    global _BIP_SOLO_ARMED
     if rig is None or getattr(rig, 'type', '') != 'ARMATURE':
         return False
     if not bip_solo_enabled():
@@ -15734,6 +15756,7 @@ def bip_solo_apply(context, rig, active=None, keep=None):
     # 必须在写 hide 之前；交还失败重新 apply 时 hide 已被还原成原始值。
     bip_solo_nav_snapshot(rig)
     _BIP_SOLO_KEEP = set(ks)
+    _BIP_SOLO_ARMED = True   # v3.0：本轮独显授权零快照兜底
     n = 0
     for b in rig.pose.bones:
         try:
@@ -15815,6 +15838,59 @@ def bip_solo_forget():
     _BIP_SOLO_KEEP = set()
 
 
+def _bip_solo_disarm():
+    """v3.0：BIP operator 正常收尾后消费掉「零快照兜底」授权。
+
+    armed 的本意是「本轮 BIP 独显还没走正常清理」——只有 Blender 直接
+    丢弃模态（连 cancel 都没给）时才该留着让定时守卫兜底。正常确认 /
+    取消 / 交还之后必须清掉：此后用户再进驭骨原生旋转模式，即使模态
+    探测万一失效，定时守卫也不会把整副控制器亮回来（旋转闪烁的第二道
+    保险）。撤销残留仍由 undo_post 即时修复，不依赖这个标志。
+    """
+    global _BIP_SOLO_ARMED
+    _BIP_SOLO_ARMED = False
+
+
+def _bip_foreign_modal_active():
+    """当前是否有「非 BIP」的模态算子在跑（驭骨自己的 MOVE / ROT 等）。
+
+    v3.0：驭骨原生模态按完全相同的规则独显（可见集 = 选中骨），在 hide
+    数值上与 BIP 的撤销残留无法区分 —— v2.9 的守卫会把正在旋转时的独显
+    当成残留整副亮回来，表现为「先全部隐藏，轻微一动又突然全部显示」。
+    唯一可靠依据是事件上下文：别的模态还在跑，显隐就归它管，BIP 不插手。
+    """
+    probe = globals().get('_BIP_FOREIGN_MODAL_PROBE')
+    if probe is not None:
+        try:
+            return bool(probe())
+        except Exception:
+            return False
+    # ① 驭骨主文件的模态闸门（进模态置 True、_clear() 放闸）。这是真实 GUI
+    #    下最可靠的信号：只有驭骨自己的 MOVE / ROT 模态会置位，插件常驻
+    #    模态不会误触。后台回归里残留的 True 不采信，避免守卫被永久关掉。
+    try:
+        gate = globals().get('_MODAL_ONCE')
+        if (gate and gate[0] and not _bip_bpy.app.background
+                and _bip_bpy.context.window is not None):
+            return True
+    except Exception:
+        pass
+    # ② 闸门尚未置位 / 交还间隙的补充：只看会接管显隐的算子，白名单之外
+    #    （用户装的插件常驻监听）一律不算。
+    try:
+        hints = _BIP_FOREIGN_MODAL_HINTS
+        for w in _bip_bpy.context.window_manager.windows:
+            for op in getattr(w, 'modal_operators', ()) or ():
+                idn = (getattr(op, 'bl_idname', '') or '').lower()
+                if not idn or 'cn_bip_drag' in idn:
+                    continue
+                if any(h in idn for h in hints):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def bip_solo_leak_signature(rig, clean, keep):
     """判断当前显隐是不是「上一次 BIP 独显」被外部恢复出来的残留。
 
@@ -15877,9 +15953,18 @@ def bip_solo_guard():
     只负责「Blender 连 cancel 都没给、直接把模态丢了」的极端情况。
     """
     global _BIP_SOLO_GUARD_LOG, _BIP_SOLO_GUARD_HITS
+    global _BIP_SOLO_ARMED, _BIP_FOREIGN_SKIPS
     if _BIP_DRAG_ACTIVE:
         return False
     if _BIP_SOLO_ACTIVE is None:
+        # v3.0：零快照兜底必须同时满足「没有别的模态在管显隐」和「本轮
+        # BIP 独显仍授权」。否则驭骨 ROT 模态的正常独显会被误还原（闪烁）。
+        if _bip_foreign_modal_active():
+            _BIP_SOLO_ARMED = False
+            _BIP_FOREIGN_SKIPS += 1
+            return False
+        if not _BIP_SOLO_ARMED:
+            return False
         # v2.9：撤销 / 重做把独显态恢复出来时快照已 forget，定时兜底补上。
         try:
             return bool(bip_solo_repair_after_undo('定时兜底'))
@@ -15908,7 +15993,16 @@ def bip_solo_repair_after_undo(tag='撤回'):
     姿态、关键帧、运动路径的撤销结果完全不受影响。
     """
     global _BIP_UNDO_BUSY, _BIP_UNDO_LOG, _BIP_UNDO_HITS
+    global _BIP_SOLO_ARMED, _BIP_FOREIGN_SKIPS
+    # 拖动中 / 重入一律先早退：BIP 自己启动的视角导航也是外来模态，
+    # 不能让它把本轮授权顺手撤掉。
     if _BIP_UNDO_BUSY or _BIP_DRAG_ACTIVE:
+        return False
+    # v3.0：别的模态正在独显时一律放行。撤销回调在旋转过程中也会触发，
+    # 此时 hide 分布与 BIP 残留一模一样，只能靠「谁在管显隐」来区分。
+    if _bip_foreign_modal_active():
+        _BIP_SOLO_ARMED = False
+        _BIP_FOREIGN_SKIPS += 1
         return False
     c = _BIP_SOLO_CLEAN
     if not c:
@@ -15938,6 +16032,7 @@ def bip_solo_repair_after_undo(tag='撤回'):
     finally:
         _BIP_UNDO_BUSY = False
     _BIP_UNDO_HITS += 1
+    _BIP_SOLO_ARMED = False      # 已处理，别再让定时兜底重复扫
     _BIP_UNDO_LOG = '%s后还原 %d 根 · 累计 %d 次' % (
         tag, wrong, _BIP_UNDO_HITS)
     try:
@@ -16137,6 +16232,7 @@ class POSE_OT_cn_bip_drag_v45(_bip_bpy.types.Operator):
         _BIP_DRAG_ACTIVE = False
         # 显隐永远先还原（幂等），哪怕这是交还后的重复调用。
         bip_solo_restore(context)
+        _bip_solo_disarm()
         if (getattr(self, '_handed_off', False)
                 or getattr(self, '_bip_ended', False)):
             # 已由 _handoff / cancel 提交并结束，不能再 bip_end 一次
@@ -16158,6 +16254,7 @@ class POSE_OT_cn_bip_drag_v45(_bip_bpy.types.Operator):
         global _BIP_DRAG_ACTIVE
         _BIP_DRAG_ACTIVE = False
         bip_solo_restore(context)
+        _bip_solo_disarm()
         if (not getattr(self, '_handed_off', False)
                 and not getattr(self, '_bip_ended', False)
                 and getattr(self, 'state', None) is not None):
@@ -16210,11 +16307,13 @@ class POSE_OT_cn_bip_drag_v45(_bip_bpy.types.Operator):
         if ok:
             # 驭骨模态已自己抓了正确的快照并接管显隐，本轮 BIP 快照作废。
             bip_solo_forget()
+            _bip_solo_disarm()
         else:
             # v2.8：BIP 马上返回 FINISHED、模态没了，这里绝不能再留 hide=True。
             # v2.7 在此 reapply 重新独显，快照从此无人还原 —— 实测 425/426 根
             # 骨留成隐藏，用户只能按 Alt H。按开拖前快照还原才是正确收尾。
             bip_solo_restore(context)
+            _bip_solo_disarm()
             try:
                 self.report({'WARNING'},
                             '已切到 %s，但未自动进入%s；再按一次%s键即可'
@@ -16275,6 +16374,7 @@ class POSE_OT_cn_bip_drag_v45(_bip_bpy.types.Operator):
         except Exception as exc:
             _BIP_DRAG_ACTIVE = False
             bip_solo_restore(context)
+            _bip_solo_disarm()
             try:
                 if (not getattr(self, '_handed_off', False)
                         and not getattr(self, '_bip_ended', False)):
@@ -16631,7 +16731,7 @@ class VIEW3D_PT_cn_bip_v45(_bip_bpy.types.Panel):
             key_label = globals()['move_key_label']()
         except Exception:
             key_label = '移动键'
-        layout.label(text='已并入驭骨 v2.9 · 撤回后控制器不再残留隐藏',
+        layout.label(text='已并入驭骨 v3.0 · 旋转模式独显不再闪烁',
                      icon='CHECKMARK')
         box = layout.box()
         box.label(text='选中 FK 手控骨按 %s' % key_label, icon='LINKED')
@@ -16656,6 +16756,7 @@ class VIEW3D_PT_cn_bip_v45(_bip_bpy.types.Panel):
         box.label(text='求解模式: %s' % _BIP_MODE_LOG, icon='INFO')
         box.label(text='独显: %s' % _BIP_SOLO_LOG, icon='INFO')
         box.label(text='显隐兜底: %s' % _BIP_SOLO_GUARD_LOG, icon='INFO')
+        box.label(text='模态隔离: 放行 %d 次' % _BIP_FOREIGN_SKIPS, icon='INFO')
         box.label(text='撤销显隐: %s' % _BIP_UNDO_LOG, icon='INFO')
         # v2.3：已有动画被旧版旋转模式写坏过关键帧时，一键归一化分支。
         fixbox = layout.box()
