@@ -2355,6 +2355,8 @@ def _bip_solo_timer():
         # 载入 .blend 后 handlers 可能被 Blender 清掉；常驻定时器每轮补装。
         _bip_install_undo_hooks()
         bip_solo_guard()
+        # v3.1：ARP 是 extension，可能比本插件晚注册，每轮补装一次包装。
+        _bip_install_ikfk_guard()
     except Exception:
         pass
     return 0.5
@@ -2989,7 +2991,7 @@ class VIEW3D_PT_cn_bip_v45(_bip_bpy.types.Panel):
             key_label = globals()['move_key_label']()
         except Exception:
             key_label = '移动键'
-        layout.label(text='已并入驭骨 v3.0 · 旋转模式独显不再闪烁',
+        layout.label(text='已并入驭骨 v3.1 · ARP IK/FK 切换不再毁动画',
                      icon='CHECKMARK')
         box = layout.box()
         box.label(text='选中 FK 手控骨按 %s' % key_label, icon='LINKED')
@@ -3016,6 +3018,10 @@ class VIEW3D_PT_cn_bip_v45(_bip_bpy.types.Panel):
         box.label(text='显隐兜底: %s' % _BIP_SOLO_GUARD_LOG, icon='INFO')
         box.label(text='模态隔离: 放行 %d 次' % _BIP_FOREIGN_SKIPS, icon='INFO')
         box.label(text='撤销显隐: %s' % _BIP_UNDO_LOG, icon='INFO')
+        box.label(text='IKFK 保护: %s%s'
+                  % (_BIP_IKFK_LOG,
+                     '' if _BIP_IKFK_ORIG_EXEC is not None else ' (未装载)'),
+                  icon='INFO')
         # v2.3：已有动画被旧版旋转模式写坏过关键帧时，一键归一化分支。
         fixbox = layout.box()
         fixbox.label(text='旧关键帧中间插值乱转？', icon='ERROR')
@@ -3068,6 +3074,324 @@ class VIEW3D_PT_cn_bip_v45(_bip_bpy.types.Panel):
         layout.prop(context.scene, 'cn_bip_default_side', text='默认侧')
 
 
+# ------------------------------------------------------------------- v3.1
+# ARP 原生 IK/FK 切换会污染 FK 曲线：
+#   pose.arp_switch_snap -> fk_to_ik_arm() -> snap_rot() -> set_pose_rotation()
+#   后者用 mat.to_quaternion() / q.to_euler(mode) 把 IK 链姿态直接写进 FK
+#   控制器，既不保证与相邻关键帧同分支，也不保证与切换前的姿态一致；
+#   autokey 下还会把该值插成关键帧。
+#   实测 D踏步上挑.blend：一次 FK→IK→FK 往返把 f24 的 FK 关键帧姿态改写
+#   85.16°，逐帧 >12° 跳变 46 → 74，最大 54.7° → 85.9°。
+# 对策：运行时包装 ARP 切换算子（不改 ARP 源码、不写 .blend 数据）：
+#   · FK→IK 前快照该侧 FK 链旋转曲线；切换后记录 ARP 自己吸附出的 IK 指纹
+#   · IK→FK 时若帧号与指纹都没变（用户没在 IK 下动过控制器）→ 原样恢复
+#     FK 曲线，姿态与表示完全不变；若动过 → 尊重 ARP 的匹配结果
+#   · 两种情况都跑一次分支连续化，拦住 ARP 的 q.to_euler() 落错分支
+_BIP_IKFK_ORIG_EXEC = None
+_BIP_IKFK_STATE = {}
+_BIP_IKFK_LOG = '未运行'
+_BIP_IKFK_FP_BONES = ('c_hand_ik', 'c_arms_pole', 'c_arm_ik',
+                      'c_hand_ik_offset', 'c_hand_ik_pivot')
+_BIP_IKFK_ROT_TAILS = ('rotation_euler', 'rotation_quaternion',
+                       'rotation_axis_angle')
+
+
+def _bip_ikfk_switch_bones(rig):
+    """所有带 ik_fk_switch 的手/脚控骨，按侧归类。"""
+    out = {}
+    for p in rig.pose.bones:
+        if 'ik_fk_switch' not in p.keys():
+            continue
+        side = p.name[-2:]
+        if side not in ('.l', '.r'):
+            continue
+        # 只管手臂（脚控骨由 ARP 自己处理，不介入）
+        if 'hand' not in p.name.lower():
+            continue
+        out[side] = p
+    return out
+
+
+def _bip_ikfk_fk_names(rig, side):
+    """该侧 FK 手臂链骨名：bip_resolve 精确解析 + 命名兜底。"""
+    names = set()
+    try:
+        ctx = _bip_bpy.context
+        for p in rig.pose.bones:
+            if (bip_side_of_pb(p, rig) == side
+                    and bip_is_ctrl(p) and bip_is_fk(p.name)
+                    and bip_role(p.name) == 'hand'):
+                amap = bip_resolve(ctx, active=p)
+                if amap:
+                    names.update(amap['fk'])
+                    names.add(amap['fk_hand'])
+                    # 精确解析成功就不再用宽松兜底：形变骨 arm_fk /
+                    # forearm_fk 和 pole 辅助骨不该进入保护与连续化范围。
+                    return names
+    except Exception:
+        pass
+    try:
+        for p in rig.pose.bones:
+            n = p.name
+            if (bip_side_of_pb(p, rig) == side and bip_is_ctrl(p)
+                    and bip_is_fk(n)
+                    and bip_role(n) in ('upper', 'forearm', 'hand')):
+                names.add(n)
+    except Exception:
+        pass
+    return names
+
+
+def _bip_ikfk_snapshot(rig, names):
+    """快照 FK 链当前生效旋转通道的全部关键点（含手柄/插值）。"""
+    act = getattr(getattr(rig, 'animation_data', None), 'action', None)
+    if act is None or not names:
+        return {}
+    snap = {}
+    try:
+        for fc in _bip_action_fcurves(act):
+            dp = getattr(fc, 'data_path', '') or ''
+            if '"' not in dp:
+                continue
+            try:
+                bone = dp.split('"', 2)[1]
+            except Exception:
+                continue
+            if bone not in names:
+                continue
+            tail = dp.rsplit('.', 1)[-1]
+            if tail not in _BIP_IKFK_ROT_TAILS:
+                continue
+            snap[(dp, fc.array_index)] = [
+                (float(k.co[0]), float(k.co[1]),
+                 tuple(float(v) for v in k.handle_left),
+                 tuple(float(v) for v in k.handle_right),
+                 str(k.interpolation), str(k.easing), str(k.type),
+                 str(k.handle_left_type), str(k.handle_right_type))
+                for k in fc.keyframe_points]
+    except Exception:
+        pass
+    return snap
+
+
+def _bip_ikfk_restore(rig, snap):
+    """把 FK 曲线原样还原；ARP 新增的帧会在重建时一并消失。"""
+    act = getattr(getattr(rig, 'animation_data', None), 'action', None)
+    if act is None or not snap:
+        return 0
+    bykey = {}
+    try:
+        for fc in _bip_action_fcurves(act):
+            bykey[(fc.data_path, fc.array_index)] = fc
+    except Exception:
+        return 0
+    changed = 0
+    for key, pts in snap.items():
+        fc = bykey.get(key)
+        if fc is None:
+            continue
+        # ARP 的 snap_rot 即便姿态几乎不变，也会把关键帧值改到 1e-6 量级
+        # （实测 f24 四元数 W 差 4.65e-6）。比较精度必须高于这个量级，
+        # 否则会被误判成「没变化」而跳过重建，脏值永久留下。
+        cur = [(round(float(k.co[0]), 4), round(float(k.co[1]), 7))
+               for k in fc.keyframe_points]
+        old = [(round(x, 4), round(y, 7)) for x, y, *_ in pts]
+        if cur == old:
+            continue
+        try:
+            while len(fc.keyframe_points):
+                fc.keyframe_points.remove(fc.keyframe_points[0])
+            for (x, y, hl, hr, interp, easing, ktype,
+                 hl_type, hr_type) in pts:
+                k = fc.keyframe_points.insert(x, y)
+                # 必须先还原插值与手柄类型：新建关键点默认是 AUTO，
+                # 直接写手柄坐标会在 fc.update() 时被按邻居重算，
+                # 实测会把原曲线 5.0 的手柄改成 4.333，中间帧姿态漂移。
+                for attr, val in (('interpolation', interp),
+                                  ('easing', easing), ('type', ktype),
+                                  ('handle_left_type', hl_type),
+                                  ('handle_right_type', hr_type)):
+                    try:
+                        setattr(k, attr, val)
+                    except Exception:
+                        pass
+                try:
+                    k.handle_left = hl
+                    k.handle_right = hr
+                except Exception:
+                    pass
+            fc.update()
+            changed += 1
+        except Exception:
+            pass
+    return changed
+
+
+def _bip_ikfk_fingerprint(rig, side):
+    """IK 控制器状态指纹：用来区分「纯往返切换」和「用户在 IK 下摆了姿势」。"""
+    vals = []
+    for base in _BIP_IKFK_FP_BONES:
+        p = rig.pose.bones.get(base + side)
+        if p is None:
+            continue
+        vals.append(base)
+        for attr in ('location', 'rotation_euler',
+                     'rotation_quaternion', 'scale'):
+            try:
+                vals.append(tuple(round(float(v), 5)
+                                  for v in getattr(p, attr)))
+            except Exception:
+                pass
+    return tuple(vals)
+
+
+def _bip_ikfk_find_class():
+    """ARP 是 extension 动态注册，类名不一定挂在 bpy.types 上。"""
+    bp = _bip_bpy
+    cls = getattr(bp.types, 'ARP_OT_switch_snap', None)
+    if cls is not None and cls.__dict__.get('execute'):
+        return cls
+    try:
+        import importlib
+        for mod in ('bl_ext.user_default.auto_rig_pro.src.rig_functions',
+                    'auto_rig_pro.src.rig_functions'):
+            try:
+                modobj = importlib.import_module(mod)
+                c = getattr(modobj, 'ARP_OT_switch_snap', None)
+                if c is not None and c.__dict__.get('execute'):
+                    return c
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        stack = list(bp.types.Operator.__subclasses__())
+        seen = set()
+        while stack:
+            c = stack.pop()
+            if c in seen:
+                continue
+            seen.add(c)
+            if getattr(c, 'bl_idname', '') == 'pose.arp_switch_snap':
+                return c
+            try:
+                stack.extend(c.__subclasses__())
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _bip_arp_switch_wrapped(self, context):
+    """包装 ARP 的 IK/FK 切换：保护 FK 曲线，同时保留 ARP 原生匹配能力。"""
+    global _BIP_IKFK_LOG
+    orig = _BIP_IKFK_ORIG_EXEC
+    if orig is None:
+        return {'CANCELLED'}
+    rig = context.active_object
+    valid = False
+    try:
+        valid = (rig is not None and rig.type == 'ARMATURE'
+                 and bip_is_arp_rig(rig))
+    except Exception:
+        pass
+    v_before, fp_before, snap_before = {}, {}, {}
+    if valid:
+        try:
+            for side, pb in _bip_ikfk_switch_bones(rig).items():
+                v_before[side] = float(pb['ik_fk_switch'])
+                fp_before[side] = _bip_ikfk_fingerprint(rig, side)
+                if v_before[side] >= 0.5:
+                    names = _bip_ikfk_fk_names(rig, side)
+                    snap_before[side] = (names, _bip_ikfk_snapshot(rig, names))
+        except Exception:
+            pass
+    # 原算子异常一律原样抛出，绝不因为保护逻辑让 ARP 切换失败
+    ret = orig(self, context)
+    if not valid:
+        return ret
+    try:
+        frame = int(context.scene.frame_current)
+        for side, pb in _bip_ikfk_switch_bones(rig).items():
+            vb = v_before.get(side)
+            if vb is None:
+                continue
+            v_after = float(pb['ik_fk_switch'])
+            key = (rig.name, side)
+            names = set()
+            if vb >= 0.5 and v_after < 0.5:
+                # FK → IK：存快照；指纹取 ARP 吸附完成之后的 IK 状态
+                names, snap = snap_before.get(side, (set(), {}))
+                if snap:
+                    _BIP_IKFK_STATE[key] = {
+                        'names': names, 'snap': snap,
+                        'fp': _bip_ikfk_fingerprint(rig, side),
+                        'frame': frame}
+            elif vb < 0.5 and v_after >= 0.5:
+                # IK → FK
+                st = _BIP_IKFK_STATE.pop(key, None)
+                restored = False
+                if st:
+                    names = st['names']
+                    unchanged = (frame == st['frame']
+                                 and fp_before.get(side) == st['fp'])
+                    if unchanged:
+                        n = _bip_ikfk_restore(rig, st['snap'])
+                        restored = True
+                        _BIP_IKFK_LOG = 'IKFK 往返 · 已保护 %d 条 FK 曲线' % n
+                    else:
+                        _BIP_IKFK_LOG = 'IKFK · IK 姿势有改动，保留 ARP 匹配'
+                else:
+                    names = _bip_ikfk_fk_names(rig, side)
+                    _BIP_IKFK_LOG = 'IKFK · 无快照，仅理顺分支'
+                # 恢复成功 = 曲线已逐帧回到切换前，此时绝不能再跑连续化，
+                # 否则会把用户原本干净的曲线也改掉（实测 15.56° 漂移）。
+                # 只有「尊重 ARP 匹配」或「无快照」时才理顺新写入的分支。
+                if names and not restored:
+                    try:
+                        bip_normalize_rotation_curves(
+                            rig, bone_names=names, dry_run=False)
+                    except Exception:
+                        pass
+                try:
+                    context.view_layer.update()
+                except Exception:
+                    pass
+    except Exception as exc:
+        _BIP_IKFK_LOG = 'IKFK 保护异常: %s' % str(exc)[:40]
+    return ret
+
+
+def _bip_install_ikfk_guard():
+    global _BIP_IKFK_ORIG_EXEC
+    if _BIP_IKFK_ORIG_EXEC is not None:
+        return True
+    cls = _bip_ikfk_find_class()
+    if cls is None:
+        return False
+    cur = cls.__dict__.get('execute')
+    if cur is None or getattr(cur, '__name__', '') == '_bip_arp_switch_wrapped':
+        return False
+    _BIP_IKFK_ORIG_EXEC = cur
+    cls.execute = _bip_arp_switch_wrapped
+    return True
+
+
+def _bip_remove_ikfk_guard():
+    global _BIP_IKFK_ORIG_EXEC
+    cls = _bip_ikfk_find_class()
+    if cls is not None and _BIP_IKFK_ORIG_EXEC is not None:
+        if (getattr(cls.__dict__.get('execute'), '__name__', '')
+                == '_bip_arp_switch_wrapped'):
+            try:
+                cls.execute = _BIP_IKFK_ORIG_EXEC
+            except Exception:
+                pass
+    _BIP_IKFK_ORIG_EXEC = None
+    _BIP_IKFK_STATE.clear()
+
+
 def bip_register():
     global _BIP_OWNED
     if _BIP_OWNED:
@@ -3106,11 +3430,16 @@ def bip_register():
         _BIP_ALIGN_CACHE.clear()
     except Exception:
         pass
-    _bip_install_solo_guard()          # v2.8：0.5s 显隐残留兜底
+    _bip_install_solo_guard()          # v2.8：0.5s 显隐残留兜底（内含 v3.1 补装）
     try:
         _bip_install_undo_hooks()      # v2.9：Ctrl+Z / 重做即时还原显隐
     except Exception as exc:
         print('[ARP BIP] undo hooks: %s' % exc)
+    try:
+        if not _bip_install_ikfk_guard():   # v3.1：ARP 切换 FK 曲线保护
+            print('[ARP BIP] ikfk guard pending (ARP not registered yet)')
+    except Exception as exc:
+        print('[ARP BIP] ikfk guard: %s' % exc)
     _BIP_OWNED = True
 
 
@@ -3121,6 +3450,7 @@ def bip_unregister():
     # 禁用插件时若 BIP 模态还挂着，先把显隐还原，别把骨架留在独显状态。
     _BIP_DRAG_ACTIVE = False
     bip_solo_restore()
+    _bip_remove_ikfk_guard()       # v3.1：原样还原 ARP 切换算子
     _bip_remove_solo_guard()
     _bip_remove_undo_hooks()
     _bip_remove_mpath_hooks()

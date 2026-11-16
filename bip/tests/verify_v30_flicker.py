@@ -199,7 +199,8 @@ try:
     consts = list(m.VIEW3D_PT_cn_bip_v45.draw.__code__.co_consts)
 except Exception:
     pass
-check('I1 面板版本标记 v3.0', any('v3.0' in str(c) for c in consts))
+check('I1 面板版本标记 v3.x', any(('v3.0' in str(c) or 'v3.1' in str(c))
+                                 for c in consts))
 check('I2 面板有模态隔离诊断行', any('模态隔离' in str(c) for c in consts))
 
 # ------------------------------- K 真实收尾链路：消费授权后 v2.9 撤回修复仍在

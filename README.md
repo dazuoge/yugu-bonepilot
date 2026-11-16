@@ -1,6 +1,6 @@
 # 驭骨 · BonePilot
 
-> **当前分支 `arp-bip-v2.7` = 官方 v5.2.45 + ARP BIP 扩展 v3.0（实验分支）**
+> **当前分支 `arp-bip-v2.7` = 官方 v5.2.45 + ARP BIP 扩展 v3.1（实验分支）**
 >
 > 给 ARP 骨架加了「拖 FK 手控骨、手臂像 3ds Max Biped 一样 IK 跟随、结果仍写回 FK」
 > 的能力，并让 BIP 拖动时也只显示当前控制器。`main` 分支仍是纯净的 v5.2.45，
@@ -11,17 +11,17 @@ Blender 插件：按集合导航控制器，快速旋转/移动，逐段撤销�
 
 面向 **Blender 5.2+**（Rigify / AniMate / ARP 类骨架均可使用）；本分支的 BIP 扩展在 **Blender 5.3** 上实测。
 
-当前版本：**v5.2.45 + ARP BIP v3.0**（2026-11-16，本分支）
+当前版本：**v5.2.45 + ARP BIP v3.1**（2026-11-16，本分支）
 
 ## 下载
 
-- **打包下载（推荐）**：[Releases → `bip-v3.0`](https://github.com/dazuoge/yugu-bonepilot/releases/tag/bip-v3.0)
-  - `yugu-bonepilot-bip-v3.0.zip` —— 单文件可拖入安装版（包内 `controller_navigator_v4971.py`）
-  - `yugu-bonepilot-bip-v3.0-source.zip` —— 扩展源码、幂等植入器、全套回归与 v1.6~v2.9 回退备份
+- **打包下载（推荐）**：[Releases → `bip-v3.1`](https://github.com/dazuoge/yugu-bonepilot/releases/tag/bip-v3.1)
+  - `yugu-bonepilot-bip-v3.1.zip` —— 单文件可拖入安装版（包内 `controller_navigator_v4971.py`）
+  - `yugu-bonepilot-bip-v3.1-source.zip` —— 扩展源码、幂等植入器、全套回归与 v1.6~v3.0 回退备份
   - 该 Release 为 **预发布**，`/releases/latest` 仍指向正式版 v5.2.45。
-  - `bip-v2.9` 及更早版本已过时：用驭骨原生旋转模式时控制器会闪烁，请用 v3.0。
+  - `bip-v3.0` 及更早版本已过时：ARP 原生 IK/FK 切换会写坏 FK 动画，请用 v3.1。
 - **本分支整合版（推荐）**：[`controller_navigator.py`](controller_navigator.py)
-  —— 已内置 ARP BIP v3.0，可直接按下方步骤安装；本地文件 md5 `c0258e375e5490040bd1c7c7e0e6a6df`
+  —— 已内置 ARP BIP v3.1，可直接按下方步骤安装；本地文件 md5 `d9eb71b34be994f9110c78a8d935422c`
   （CRLF 换行；经 GitHub 下载时行尾可能被规范化，不影响使用）。
 - **官方稳定版 v5.2.45**：切到 `main` 分支，或到
   [Releases → 最新版](https://github.com/dazuoge/yugu-bonepilot/releases/latest)
@@ -73,6 +73,10 @@ Blender 插件：按集合导航控制器，快速旋转/移动，逐段撤销�
 - **旋转模式下控件不再闪烁**（v3.0）：修掉「手掌控制器进旋转模式，其他控制器
   先隐藏、轻微一动又全部亮出来」。守卫现在先判断显隐归谁管，只处理 BIP 自己
   造成的残留；正常收尾即消费兜底授权，v2.9 的撤回修复完全保留。
+
+- **ARP 原生 IK/FK 切换不再毁掉 FK 动画**（v3.1）：做过 BIP 拖动的手臂
+  切到 IK 再切回 FK，插件会保护 FK 旋转曲线逐帧还原；如果确实在 IK 下
+  摆过姿势，则完整保留 ARP 的匹配结果，只自动理顺旋转分支。
 
 仅限 ARP 骨架，Rigify / AniMate 行为不变。详细说明、边界与实测数据见
 [`bip/README.md`](bip/README.md)。
