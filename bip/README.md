@@ -1,4 +1,4 @@
-# ARP BIP 扩展 · v3.1
+# ARP BIP 扩展 · v3.2
 
 给「驭骨 · BonePilot」v5.2.45 增加一个 **ARP 骨架专用的 BIP 式拖手**：
 拖动 FK 手控骨时，上臂 / 前臂像 3ds Max Biped 那样 IK 跟随，但**结果写回 FK 旋转**，
@@ -97,6 +97,38 @@ v3.1 保护下真实工程 21 条 FK 曲线逐帧完全一致、姿态差 0.0396
 回归：`verify_v31_ikfk.py` **18/18**（含 IK 下主动摆姿势仍尊重 ARP、
 原 ARP 算子与 BIP 拖动算子完好）。
 
+## v3.2 修复：IK/FK 快速切换改走 ARP 原生（2026-11-16）
+
+用户复测指出：用**插件自带的 IK/FK 快速切换**（快捷键 I / O 面板）切完再切回
+就暴跳，用 **ARP 原生切换**则没问题 —— v3.1 只保护了原生按钮这一条路。
+
+**根因**：主文件的 `pose.cn_ikfk_toggle_v45` 走 `limb_switch()` →
+`_switch_once(kind='calc')`。ARP 骨架由 `_limbs_animate()` 造出的 `CN_Limb`
+不带 `rigify_to_fk/rigify_to_ik`，`has_native=False`，切换顺序被写死成
+`['calc']`，**从不调用 `pose.arp_switch_snap`**。自算里：
+
+1. `_snap_by_matrix()` 用 `pb.matrix = ...` 把 BIP 连续化后的 ±2π 分支压回主分支；
+2. `_key_limb()` 紧接着把两侧控制器 location / rotation / scale 全量插帧，
+   把这个主分支值钉成关键帧，夹在两侧 ±2π 帧之间 → 插值绕远路 → 暴跳。
+
+实测（`D踏步上挑.blend`，f24，FK→IK→FK，2π 分支基线）：
+自写切换 **54 跳变 / 最大 138.28°**；v3.1 保护下的 ARP 原生按钮 0 / 0°。
+隔离实验证明自算 snap 本身不写曲线，单独换原生、或单独去掉全量插帧都够。
+
+| 防线 | 作用 |
+| --- | --- |
+| `_bip_arp_limb_switch()` | 运行时替换模块全局 `limb_switch`，ARP 类骨架整条委托给 `pose.arp_switch_snap`；非 ARP 骨架（Rigify / 自带 snap）原样回退 |
+| `_bip_arp_select_limb()` | ARP 按选中骨判 side/type，只选目标肢体一根 FK 控制器；临时放出被显隐同步藏起来的骨，避免 ARP 静默不生效 |
+| `_bip_arp_key_limb()` | 原生路径下跳过驭骨的额外全量插帧（ARP 自己会插）；非 ARP 骨架照常插帧 |
+| v3.1 指纹修正 | `c_arms_pole` 被 ARP 每次切换无条件重算，不能当「用户动过 IK」的证据，从指纹骨列表剔除；否则多条肢体连切会误判、放弃曲线恢复 |
+
+不改主文件源码、不改 ARP 源码，禁用插件时 `limb_switch` / `_key_limb`
+原样还原；`bip_register()` 与常驻 timer 都会幂等补装，规避加载顺序。
+
+**实测**：`verify_v32_native.py` **32/32**（2π 基线 0 跳变、工程原样曲线
+61→61 不加剧、全部肢体往返 0 跳变、非 ARP 回退、卸载还原、显隐/选择迁移
+等原有行为保留）；`verify_v31_ikfk.py` 18/18、`verify_v30_flicker.py` 39/39。
+
 ## 文件
 
 | 文件 | 用途 |
@@ -108,6 +140,7 @@ v3.1 保护下真实工程 21 条 FK 曲线逐帧完全一致、姿态差 0.0396
 | `tests/verify_v29_undo.py` | 专项回归：撤销 / 重做后的显隐守卫、判据与回调注册。 |
 | `tests/verify_v30_flicker.py` | 专项回归：原生旋转模态独显不被误还原、真实撤回修复仍在。 |
 | `tests/verify_v31_ikfk.py` | 专项回归：ARP IK/FK 切换前后 FK 曲线逐帧一致、主动 IK 摆姿势仍生效。 |
+| `tests/verify_v32_native.py` | 专项回归：I 键改走 ARP 原生、多肢体往返、非 ARP 回退与卸载还原。 |
 
 完整的 44 组回归、诊断脚本与 v1.6~v2.6 回退备份见本地交付包
 `ARP_BIP_驭骨扩展_v2.7_20261114.zip`。

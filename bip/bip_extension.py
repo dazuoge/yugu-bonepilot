@@ -2357,6 +2357,8 @@ def _bip_solo_timer():
         bip_solo_guard()
         # v3.1：ARP 是 extension，可能比本插件晚注册，每轮补装一次包装。
         _bip_install_ikfk_guard()
+        # v3.2：I 键切换的原生接管（幂等）
+        _bip_install_arp_switch()
     except Exception:
         pass
     return 0.5
@@ -2991,7 +2993,7 @@ class VIEW3D_PT_cn_bip_v45(_bip_bpy.types.Panel):
             key_label = globals()['move_key_label']()
         except Exception:
             key_label = '移动键'
-        layout.label(text='已并入驭骨 v3.1 · ARP IK/FK 切换不再毁动画',
+        layout.label(text='已并入驭骨 v3.2 · IK/FK 快速切换改走 ARP 原生',
                      icon='CHECKMARK')
         box = layout.box()
         box.label(text='选中 FK 手控骨按 %s' % key_label, icon='LINKED')
@@ -3021,6 +3023,10 @@ class VIEW3D_PT_cn_bip_v45(_bip_bpy.types.Panel):
         box.label(text='IKFK 保护: %s%s'
                   % (_BIP_IKFK_LOG,
                      '' if _BIP_IKFK_ORIG_EXEC is not None else ' (未装载)'),
+                  icon='INFO')
+        box.label(text='IKFK 切换: %s · 原生 %d 次%s'
+                  % (_BIP_ARP_SWITCH_LOG, _BIP_ARP_SWITCH_COUNT,
+                     '' if _BIP_ARP_SWITCH_ORIG is not None else ' (未装载)'),
                   icon='INFO')
         # v2.3：已有动画被旧版旋转模式写坏过关键帧时，一键归一化分支。
         fixbox = layout.box()
@@ -3090,7 +3096,12 @@ class VIEW3D_PT_cn_bip_v45(_bip_bpy.types.Panel):
 _BIP_IKFK_ORIG_EXEC = None
 _BIP_IKFK_STATE = {}
 _BIP_IKFK_LOG = '未运行'
-_BIP_IKFK_FP_BONES = ('c_hand_ik', 'c_arms_pole', 'c_arm_ik',
+# v3.2：指纹不收 c_arms_pole。ARP 的 fk_to_ik_arm / ik_to_fk_arm 每次切换
+# 都会无条件重算 pole 的 rotation_quaternion 与 location（实测 all_limbs 往返
+# 中它在 A/B 两个值之间来回翻），把它算进指纹会把「插件自己的往返」误判成
+# 「用户在 IK 下摆过姿势」，从而放弃 FK 曲线恢复（实测 4 跳变 / 12.51°）。
+# 用户主动改 IK 姿势必然动 c_hand_ik / c_arm_ik，仍能被可靠捕获。
+_BIP_IKFK_FP_BONES = ('c_hand_ik', 'c_arm_ik',
                       'c_hand_ik_offset', 'c_hand_ik_pivot')
 _BIP_IKFK_ROT_TAILS = ('rotation_euler', 'rotation_quaternion',
                        'rotation_axis_angle')
@@ -3392,6 +3403,247 @@ def _bip_remove_ikfk_guard():
     _BIP_IKFK_STATE.clear()
 
 
+# ------------------------------------------------------------------- v3.2
+# 把驭骨自带的「IK/FK 快速切换」整条委托给 ARP 原生算子。
+#
+# 驭骨主文件的 pose.cn_ikfk_toggle_v45（快捷键 I / O 面板）走
+# limb_switch() -> _switch_once(kind='calc')。ARP 骨架由 _limbs_animate()
+# 造出的 CN_Limb 不带 rigify_to_fk/rigify_to_ik，has_native=False，
+# order 被写死成 ['calc'] —— 从来不调用 pose.arp_switch_snap。自算里
+#   _snap_by_matrix() 用 pb.matrix 把 BIP 连续化的 ±2π 分支压回主分支，
+#   _key_limb()    紧接着把两侧控制器 location/rotation/scale 全量插帧，
+# 插出的关键帧夹在 2π 分支帧之间，中间帧插值绕远路，播放暴跳。
+# ARP 原生算子没这个问题，而且 v3.1 已经给它加了 FK 曲线保护。
+#
+# 实测（D踏步上挑.blend，f24，FK->IK->FK，2π 分支基线）：
+#   自写 54 跳变 / 138.28°，改走原生 0 跳变 / 0°。
+#
+# 实现只在运行时替换模块全局 limb_switch，不动主文件源码、不动 ARP 源码，
+# unregister 原样还原。Rigify / 游戏系自定义绑定一律回退到驭骨原实现。
+
+_BIP_ARP_SWITCH_ORIG = None        # 原 limb_switch
+_BIP_ARP_KEY_LIMB_ORIG = None      # 原 _key_limb
+_BIP_ARP_SWITCH_USED = False       # 本轮切换是否走了 ARP 原生
+_BIP_ARP_SWITCH_LOG = '未运行'
+_BIP_ARP_SWITCH_COUNT = 0
+
+
+def _bip_arp_switch_applicable(rig, lb):
+    """只接管「驭骨本来会走自算」的 ARP 手臂/腿。"""
+    try:
+        if rig is None or getattr(rig, 'type', None) != 'ARMATURE':
+            return False
+        if getattr(lb, 'prop_name', None) != 'ik_fk_switch':
+            return False
+        # 有自己原生 snap 的骨架（Rigify / 自定义绑定）交回原实现
+        if (getattr(lb, 'rigify_to_fk', None)
+                or getattr(lb, 'rigify_to_ik', None)):
+            return False
+        if not bip_is_arp_rig(rig):
+            return False
+        fn = getattr(_bip_bpy.ops.pose, 'arp_switch_snap', None)
+        if fn is None:
+            return False
+        try:
+            if not fn.poll():
+                return False
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _bip_arp_select_limb(rig, lb):
+    """ARP 算子按选中骨判 side/type，同侧只切一次：只选目标肢体一根 FK 控制器。
+
+    优先 fk_controls[0]（按层级排序 = c_arm_fk / c_thigh_fk），这是实测
+    ARP 的 is_selected(fk_arm/fk_leg, ...) 一定认得的那根；找不到再退回
+    主控制器挑选逻辑。
+    """
+    pick = None
+    for n in (lb.fk_controls or []):
+        if rig.pose.bones.get(n) is not None:
+            pick = n
+            break
+    if pick is None:
+        try:
+            pick = globals()['_primary_control'](list(lb.fk_controls or [])
+                                                 + list(lb.ik_controls or []))
+        except Exception:
+            pick = None
+    if not pick or rig.pose.bones.get(pick) is None:
+        return None
+    try:
+        for p in rig.pose.bones:
+            p.select = False
+        rig.pose.bones[pick].select = True
+        rig.data.bones.active = rig.data.bones[pick]
+        # ARP 算子只读 context.selected_pose_bones；驭骨的显隐同步可能把
+        # 离开的那套控制器藏起来（集合不可见 / bone.hide），隐藏骨不进这个
+        # 列表，ARP 就会静默什么都不做。临时放出目标骨并刷新后再校验。
+        g = globals()
+        for helper, args in (('_set_bone_hidden', (rig, pick, False)),
+                             ('_ensure_set_visible', (rig, [pick]))):
+            try:
+                fn = g.get(helper)
+                if fn is not None:
+                    fn(*args)
+            except Exception:
+                pass
+        try:
+            _bip_bpy.context.view_layer.update()
+        except Exception:
+            pass
+        sel = [p.name for p in (_bip_bpy.context.selected_pose_bones or [])]
+        if pick not in sel:
+            return None
+    except Exception:
+        return None
+    return pick
+
+
+def _bip_arp_save_selection(rig):
+    try:
+        sel = [p.name for p in (_bip_bpy.context.selected_pose_bones or [])]
+    except Exception:
+        sel = []
+    try:
+        act = rig.data.bones.active.name if rig.data.bones.active else None
+    except Exception:
+        act = None
+    return sel, act
+
+
+def _bip_arp_restore_selection(rig, state):
+    sel, act = state
+    try:
+        for p in rig.pose.bones:
+            p.select = False
+        for n in sel:
+            pb = rig.pose.bones.get(n)
+            if pb is not None:
+                pb.select = True
+        if act and rig.data.bones.get(act) is not None:
+            rig.data.bones.active = rig.data.bones[act]
+    except Exception:
+        pass
+
+
+def _bip_arp_key_limb(rig, lb):
+    """ARP 原生路径下跳过驭骨的额外全量插帧。
+
+    ARP 自己的 keyframe_pb_transforms() 已在 autokey 下插帧；驭骨这层
+    _key_limb() 会在 v3.1 曲线保护**之后**再插一遍两侧控制器，单肢体时
+    侥幸兼容，全部肢体连切时把主分支值插回 ±2π 曲线（实测 30 跳变 /
+    52.99°）。跳过它才等于真正的「原生按钮行为」。
+    非 ARP 骨架一律照常执行原插帧，不破坏原有功能。
+    """
+    if _BIP_ARP_SWITCH_USED and _bip_arp_switch_applicable(rig, lb):
+        return 0
+    orig = _BIP_ARP_KEY_LIMB_ORIG
+    return orig(rig, lb) if orig is not None else 0
+
+
+def _bip_arp_limb_switch(rig, lb, target, hide_other=True):
+    """ARP 类骨架：一次切换 = 一次 ARP 原生 pose.arp_switch_snap。"""
+    global _BIP_ARP_SWITCH_LOG, _BIP_ARP_SWITCH_COUNT, _BIP_ARP_SWITCH_USED
+    orig = _BIP_ARP_SWITCH_ORIG
+    if orig is None or not _bip_arp_switch_applicable(rig, lb):
+        _BIP_ARP_SWITCH_USED = False
+        return orig(rig, lb, target, hide_other)
+
+    g = globals()
+    limb_mode = g.get('limb_mode')
+    sync = g.get('ikfk_sync_visibility')
+    if limb_mode is None:
+        _BIP_ARP_SWITCH_USED = False
+        return orig(rig, lb, target, hide_other)
+
+    cur = limb_mode(rig, lb)
+    if cur is None:
+        _BIP_ARP_SWITCH_USED = False
+        return orig(rig, lb, target, hide_other)
+    if cur == target:
+        if hide_other and sync:
+            try:
+                sync(rig, lb, target)
+            except Exception:
+                pass
+        return False, '%s 已经是 %s' % (lb.label, target)
+
+    saved = _bip_arp_save_selection(rig)
+    pick = _bip_arp_select_limb(rig, lb)
+    if pick is None:
+        _BIP_ARP_SWITCH_USED = False
+        _bip_arp_restore_selection(rig, saved)
+        return orig(rig, lb, target, hide_other)
+
+    try:
+        _bip_bpy.ops.pose.arp_switch_snap()
+    except Exception as exc:
+        _BIP_ARP_SWITCH_USED = False
+        _BIP_ARP_SWITCH_LOG = '原生切换异常: %s' % str(exc)[:40]
+        _bip_arp_restore_selection(rig, saved)
+        return orig(rig, lb, target, hide_other)
+
+    new = limb_mode(rig, lb)
+    if new != target:
+        # ARP 没认出这根骨（或只翻了一半）：再翻一次回到原状态，交回原实现
+        try:
+            _bip_bpy.ops.pose.arp_switch_snap()
+        except Exception:
+            pass
+        _BIP_ARP_SWITCH_USED = False
+        _BIP_ARP_SWITCH_LOG = '原生未生效(%s/%s) · 回退自算' % (cur, new)
+        _bip_arp_restore_selection(rig, saved)
+        return orig(rig, lb, target, hide_other)
+
+    _BIP_ARP_SWITCH_USED = True
+    _bip_arp_restore_selection(rig, saved)
+    if hide_other and sync:
+        try:
+            sync(rig, lb, target)
+        except Exception:
+            pass
+    _BIP_ARP_SWITCH_COUNT += 1
+    _BIP_ARP_SWITCH_LOG = '%s → %s · 原生(%s)' % (lb.label, target, pick)
+    return True, _BIP_ARP_SWITCH_LOG
+
+
+def _bip_install_arp_switch():
+    """幂等接管；ARP extension 晚注册也没关系，算子可用性在调用时再判。"""
+    global _BIP_ARP_SWITCH_ORIG, _BIP_ARP_KEY_LIMB_ORIG
+    g = globals()
+    if _BIP_ARP_SWITCH_ORIG is not None:
+        return True
+    cur = g.get('limb_switch')
+    if cur is None or cur is _bip_arp_limb_switch:
+        return False
+    _BIP_ARP_SWITCH_ORIG = cur
+    g['limb_switch'] = _bip_arp_limb_switch
+    kl = g.get('_key_limb')
+    if kl is not None and kl is not _bip_arp_key_limb:
+        _BIP_ARP_KEY_LIMB_ORIG = kl
+        g['_key_limb'] = _bip_arp_key_limb
+    return True
+
+
+def _bip_remove_arp_switch():
+    global _BIP_ARP_SWITCH_ORIG, _BIP_ARP_KEY_LIMB_ORIG, _BIP_ARP_SWITCH_USED
+    g = globals()
+    if _BIP_ARP_SWITCH_ORIG is None:
+        return
+    if g.get('limb_switch') is _bip_arp_limb_switch:
+        g['limb_switch'] = _BIP_ARP_SWITCH_ORIG
+    _BIP_ARP_SWITCH_ORIG = None
+    if _BIP_ARP_KEY_LIMB_ORIG is not None:
+        if g.get('_key_limb') is _bip_arp_key_limb:
+            g['_key_limb'] = _BIP_ARP_KEY_LIMB_ORIG
+        _BIP_ARP_KEY_LIMB_ORIG = None
+    _BIP_ARP_SWITCH_USED = False
+
+
 def bip_register():
     global _BIP_OWNED
     if _BIP_OWNED:
@@ -3440,6 +3692,11 @@ def bip_register():
             print('[ARP BIP] ikfk guard pending (ARP not registered yet)')
     except Exception as exc:
         print('[ARP BIP] ikfk guard: %s' % exc)
+    try:
+        if not _bip_install_arp_switch():   # v3.2：I 键 IK/FK 改走 ARP 原生
+            print('[ARP BIP] arp native switch pending')
+    except Exception as exc:
+        print('[ARP BIP] arp native switch: %s' % exc)
     _BIP_OWNED = True
 
 
@@ -3451,6 +3708,7 @@ def bip_unregister():
     _BIP_DRAG_ACTIVE = False
     bip_solo_restore()
     _bip_remove_ikfk_guard()       # v3.1：原样还原 ARP 切换算子
+    _bip_remove_arp_switch()       # v3.2：原样还原 limb_switch
     _bip_remove_solo_guard()
     _bip_remove_undo_hooks()
     _bip_remove_mpath_hooks()
